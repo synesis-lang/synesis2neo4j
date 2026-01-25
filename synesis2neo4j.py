@@ -1,38 +1,38 @@
 #!/usr/bin/env python3
 """
-synesis2neo4j.py - Pipeline Universal Synesis → Neo4j (Memory to Graph)
+synesis2neo4j.py - Universal Pipeline Synesis → Neo4j (Memory to Graph)
 
-Versão: 0.1.0
-Repositório: https://github.com/synesis-lang/synesis2neo4j
+Version: 0.1.0
+Repository: https://github.com/synesis-lang/synesis2neo4j
 
-Propósito:
-    Conecta o compilador Synesis diretamente ao Neo4j sem arquivos intermediários.
-    Compila o projeto em memória via `synesis.load()` e sincroniza atomicamente.
+Purpose:
+    Connects the Synesis compiler directly to Neo4j without intermediate files.
+    Compiles the project in memory via `synesis.load()` and synchronizes atomically.
 
-Componentes principais:
-    - compile_project: Compila projeto Synesis e prepara payload para grafo
-    - sync_to_neo4j: Persiste payload no Neo4j via transação única
-    - compute_metrics: Calcula métricas nativas e GDS automaticamente
-    - TaskReporter: Interface de usuário com Rich (fallback para logging)
+Main components:
+    - compile_project: Compiles Synesis project and prepares payload for graph
+    - sync_to_neo4j: Persists payload to Neo4j via single transaction
+    - compute_metrics: Calculates native and GDS metrics automatically
+    - TaskReporter: User interface with Rich (fallback to logging)
 
-Dependências críticas:
-    - synesis: compilador de projetos bibliométricos
-    - neo4j: driver oficial do banco de grafos
-    - tomli/tomllib: parser de configuração TOML
+Critical dependencies:
+    - synesis: bibliometric project compiler
+    - neo4j: official graph database driver
+    - tomli/tomllib: TOML configuration parser
 
-Dependências opcionais:
-    - Neo4j GDS: plugin para métricas avançadas (PageRank, Betweenness, Louvain)
+Optional dependencies:
+    - Neo4j GDS: plugin for advanced metrics (PageRank, Betweenness, Louvain)
 
-Exemplo de uso:
-    python synesis2neo4j.py --project ./meu_projeto.synp --config config.toml
+Usage example:
+    python synesis2neo4j.py --project ./my_project.synp --config config.toml
     python synesis2neo4j.py --version
 
-Notas de implementação:
-    - Zero I/O intermediário (tudo em memória)
-    - Atomicidade via transação única
-    - Labels dinâmicas sanitizadas contra Cypher injection
-    - Usa Result types para erros (CompilationError, ConnectionError, SyncError)
-    - Métricas calculadas automaticamente (nativas sempre, GDS se disponível)
+Implementation notes:
+    - Zero intermediate I/O (everything in memory)
+    - Atomicity via single transaction
+    - Dynamic labels sanitized against Cypher injection
+    - Uses Result types for errors (CompilationError, ConnectionError, SyncError)
+    - Metrics calculated automatically (native always, GDS if available)
 """
 from __future__ import annotations
 
@@ -48,13 +48,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 # ============================================================================
-# VERSÃO
+# VERSION
 # ============================================================================
 __version__ = "0.1.0"
 __version_info__ = (0, 1, 0)
 
 # ============================================================================
-# IMPORTS EXTERNOS
+# EXTERNAL IMPORTS
 # ============================================================================
 try:
     from synesis import SynesisCompiler
@@ -93,11 +93,11 @@ logger.addHandler(_handler)
 logger.setLevel(logging.INFO)
 
 # ============================================================================
-# TIPOS DE RESULTADO (Pattern: Result Types)
+# RESULT TYPES (Pattern: Result Types)
 # ============================================================================
 @dataclass
 class PipelineError:
-    """Erro base do pipeline com contexto."""
+    """Base pipeline error with context."""
     message: str
     stage: str
     details: Optional[str] = None
@@ -105,48 +105,48 @@ class PipelineError:
 
 @dataclass
 class CompilationError(PipelineError):
-    """Erro na compilação do projeto Synesis."""
+    """Error in Synesis project compilation."""
     diagnostics: List[str] = field(default_factory=list)
 
 
 @dataclass
 class ConnectionError(PipelineError):
-    """Erro na conexão com Neo4j."""
+    """Error connecting to Neo4j."""
     pass
 
 
 @dataclass
 class SyncError(PipelineError):
-    """Erro na sincronização com o banco."""
+    """Error synchronizing with the database."""
     pass
 
 
 @dataclass
 class ChainFieldSpec:
-    """Especificação de um campo CHAIN do template."""
+    """Specification of a CHAIN field from the template."""
     field_name: str
     relations: Dict[str, str]  # {type: description}
 
 
 @dataclass
 class CodeFieldSpec:
-    """Especificação de um campo CODE do template."""
+    """Specification of a CODE field from the template."""
     field_name: str
     description: str
 
 
 @dataclass
 class GraphPayload:
-    """Payload preparado para sincronização com Neo4j."""
+    """Payload prepared for Neo4j synchronization."""
     project_name: str
-    concept_label: str  # Label dinâmico para nós de conceito (nome do campo CHAIN/CODE)
+    concept_label: str  # Dynamic label for concept nodes (CHAIN/CODE field name)
     scalar_fields: List[str]
     graph_fields: List[str]
     chain_fields: List[ChainFieldSpec]
     code_fields: List[CodeFieldSpec]
-    value_maps: Dict[str, List[Dict[str, Any]]]  # Mapeamento de índices para labels
+    value_maps: Dict[str, List[Dict[str, Any]]]  # Mapping of indices to labels
     concepts: List[Dict[str, Any]]
-    sources: List[Dict[str, Any]]  # Anteriormente "references"
+    sources: List[Dict[str, Any]]  # Previously "references"
     items: List[Dict[str, Any]]
     chains: List[Dict[str, Any]]
     mentions: List[Dict[str, Any]]
@@ -155,24 +155,24 @@ class GraphPayload:
 
 @dataclass
 class PipelineResult:
-    """Resultado do pipeline com sucesso ou erro."""
+    """Pipeline result with success or error."""
     success: bool
     error: Optional[PipelineError] = None
     stats: Dict[str, int] = field(default_factory=dict)
 
 
 # ============================================================================
-# SANITIZAÇÃO (Proteção contra Cypher Injection)
+# SANITIZATION (Protection against Cypher Injection)
 # ============================================================================
 _CYPHER_LABEL_PATTERN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 
 def sanitize_cypher_label(label: str) -> str:
     """
-    Sanitiza string para uso seguro como label/relationship type em Cypher.
+    Sanitizes string for safe use as label/relationship type in Cypher.
 
-    Mantém apenas caracteres alfanuméricos e underscore.
-    Garante que começa com letra ou underscore.
+    Keeps only alphanumeric characters and underscore.
+    Ensures it starts with a letter or underscore.
     """
     sanitized = "".join(c for c in label if c.isalnum() or c == "_")
     if sanitized and sanitized[0].isdigit():
@@ -182,35 +182,35 @@ def sanitize_cypher_label(label: str) -> str:
 
 def sanitize_database_name(name: str) -> str:
     """
-    Sanitiza string para uso como nome de banco de dados Neo4j.
+    Sanitizes string for use as Neo4j database name.
 
-    Neo4j aceita apenas: letras ASCII, números, pontos e hífens.
-    Underscores são convertidos para hífens.
+    Neo4j accepts only: ASCII letters, numbers, dots and hyphens.
+    Underscores are converted to hyphens.
     """
-    # Converte underscores para hífens
+    # Convert underscores to hyphens
     name = name.replace("_", "-")
-    # Mantém apenas caracteres válidos
+    # Keep only valid characters
     sanitized = "".join(c for c in name if c.isalnum() or c in ".-")
-    # Garante que começa com letra
+    # Ensure it starts with a letter
     if sanitized and not sanitized[0].isalpha():
         sanitized = "db" + sanitized
     return sanitized.lower() or "synesis"
 
 
 def validate_cypher_label(label: str) -> bool:
-    """Valida se label é segura para uso direto em Cypher."""
+    """Validates if label is safe for direct use in Cypher."""
     return bool(_CYPHER_LABEL_PATTERN.match(label))
 
 
 # ============================================================================
-# INTERFACE DE USUÁRIO
+# USER INTERFACE
 # ============================================================================
 class TaskReporter:
     """
-    Reporter para feedback visual do pipeline.
+    Reporter for visual pipeline feedback.
 
-    Usa Rich quando disponível, degrada para logging padrão.
-    Recebido por injeção de dependência nas funções do pipeline.
+    Uses Rich when available, falls back to standard logging.
+    Received via dependency injection in pipeline functions.
     """
 
     def __init__(self, title: str):
@@ -251,13 +251,13 @@ class TaskReporter:
         return _StepContext(self, desc)
 
     def print_diagnostics(self, diagnostics: List[str]) -> None:
-        """Exibe erros de compilação do Synesis."""
+        """Displays Synesis compilation errors."""
         if not self.console:
             for d in diagnostics:
                 logger.error(d)
             return
 
-        table = Table(title="Diagnósticos de Compilação", box=box.SIMPLE, style="red")
+        table = Table(title="Compilation Diagnostics", box=box.SIMPLE, style="red")
         table.add_column("Mensagem", style="white")
         for diag in diagnostics:
             table.add_row(str(diag))
@@ -268,16 +268,16 @@ class TaskReporter:
         if self.console:
             table = Table(box=box.ROUNDED, show_header=False)
             table.add_row("Tempo Total", f"{duration}s")
-            status = "[green]SUCESSO[/]" if self.stats["errors"] == 0 else "[red]FALHA[/]"
+            status = "[green]SUCCESS[/]" if self.stats["errors"] == 0 else "[red]FAIL[/]"
             table.add_row("Status", status)
-            self.console.print(Panel(table, title="Resumo Final", border_style="cyan"))
+            self.console.print(Panel(table, title="Summary", border_style="cyan"))
         else:
-            status = "SUCESSO" if self.stats["errors"] == 0 else "FALHA"
-            logger.info(f"Resumo: {status} em {duration}s")
+            status = "SUCCESS" if self.stats["errors"] == 0 else "FALHA"
+            logger.info(f"Summary: {status} in {duration}s")
 
 
 class _StepContext:
-    """Context manager para etapas do pipeline com feedback visual."""
+    """Context manager for pipeline steps with visual feedback."""
 
     def __init__(self, reporter: TaskReporter, description: str):
         self.reporter = reporter
@@ -303,18 +303,18 @@ class _StepContext:
 
 
 # ============================================================================
-# ANÁLISE DE TEMPLATE
+# TEMPLATE ANALYSIS
 # ============================================================================
 def analyze_template(template_data: Dict[str, Any]) -> tuple[List[str], List[str], List[ChainFieldSpec], List[CodeFieldSpec], Dict[str, List[Dict]]]:
     """
-    Analisa template Synesis para identificar campos escalares, relacionais, CHAIN e CODE.
+    Analyzes Synesis template to identify scalar, relational, CHAIN and CODE fields.
 
     Returns:
-        Tupla (scalar_fields, graph_fields, chain_fields, code_fields, value_maps).
-        - graph_fields viram nós de taxonomia
-        - chain_fields definem nós com relações self-referential (triplas)
-        - code_fields definem referências a conceitos (lista de códigos)
-        - value_maps mapeia índices numéricos para labels (para ORDERED/ENUMERATED)
+        Tuple (scalar_fields, graph_fields, chain_fields, code_fields, value_maps).
+        - graph_fields become taxonomy nodes
+        - chain_fields define nodes with self-referential relations (triples)
+        - code_fields define references to concepts (list of codes)
+        - value_maps maps numeric indices to labels (for ORDERED/ENUMERATED)
     """
     field_specs = template_data.get("field_specs", {})
 
@@ -324,7 +324,7 @@ def analyze_template(template_data: Dict[str, Any]) -> tuple[List[str], List[str
     code_fields: List[CodeFieldSpec] = []
     value_maps: Dict[str, List[Dict]] = {}
 
-    # Itera por todos os campos e filtra por scope
+    # Iterate through all fields and filter by scope
     for field_name, spec in field_specs.items():
         scope = spec.get("scope", "").upper()
         field_type = spec.get("type", "TEXT")
@@ -332,7 +332,7 @@ def analyze_template(template_data: Dict[str, Any]) -> tuple[List[str], List[str
         if scope == "ONTOLOGY":
             if field_type in ("TOPIC", "ENUMERATED", "ORDERED"):
                 graph_fields.append(field_name)
-                # Guarda mapeamento de valores para campos ORDERED/ENUMERATED
+                # Store value mapping for ORDERED/ENUMERATED fields
                 if spec.get("values"):
                     value_maps[field_name] = spec["values"]
             else:
@@ -355,28 +355,28 @@ def analyze_template(template_data: Dict[str, Any]) -> tuple[List[str], List[str
 
 
 def get_taxonomy_labels(graph_fields: List[str]) -> List[str]:
-    """Converte nomes de campos para labels Neo4j sanitizadas."""
+    """Converts field names to sanitized Neo4j labels."""
     return [sanitize_cypher_label(f.capitalize()) for f in graph_fields]
 
 
 # ============================================================================
-# COMPILAÇÃO E PREPARAÇÃO
+# COMPILATION AND PREPARATION
 # ============================================================================
 def compile_project(
     project_path: Path,
     reporter: TaskReporter
 ) -> Union[GraphPayload, CompilationError]:
     """
-    Compila projeto Synesis e transforma em payload para Neo4j.
+    Compiles Synesis project and transforms into payload for Neo4j.
 
     Args:
-        project_path: Caminho para arquivo .synp
-        reporter: Reporter para feedback visual
+        project_path: Path to .synp file
+        reporter: Reporter for visual feedback
 
     Returns:
-        GraphPayload em caso de sucesso, CompilationError em caso de falha.
+        GraphPayload on success, CompilationError on failure.
     """
-    reporter.info(f"Iniciando compilador Synesis em: {project_path}")
+    reporter.info(f"Starting Synesis compiler at: {project_path}")
 
     compiler = SynesisCompiler(project_path)
     result = compiler.compile()
@@ -388,7 +388,7 @@ def compile_project(
             diagnostics=[str(d) for d in result.get_diagnostics()]
         )
 
-    # Exporta para JSON temporário e lê de volta
+    # Export to temporary JSON and read back
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as tmp:
         tmp_path = Path(tmp.name)
 
@@ -397,10 +397,10 @@ def compile_project(
     with open(tmp_path, 'r', encoding='utf-8') as f:
         json_data = json.load(f)
 
-    tmp_path.unlink()  # Remove arquivo temporário
+    tmp_path.unlink()  # Remove temporary file
 
     corpus_count = len(json_data.get("corpus", []))
-    reporter.success(f"Compilação OK. {corpus_count} itens processados.")
+    reporter.success(f"Compilation OK. {corpus_count} items processed.")
 
     scalar_fields, graph_fields, chain_fields, code_fields, value_maps = analyze_template(json_data["template"])
 
@@ -424,13 +424,13 @@ def _build_graph_payload(
     code_fields: List[CodeFieldSpec],
     value_maps: Dict[str, List[Dict[str, Any]]]
 ) -> GraphPayload:
-    """Transforma dados JSON compilados em payload estruturado para Neo4j."""
+    """Transforms compiled JSON data into structured payload for Neo4j."""
     project_name = json_data.get("project", {}).get("name", "synesis")
     ontology = json_data.get("ontology", {})
     corpus = json_data.get("corpus", [])
     bibliography = json_data.get("bibliography", {})
 
-    # Determina o label dinâmico baseado no primeiro campo CHAIN ou CODE
+    # Determine dynamic label based on first CHAIN or CODE field
     if chain_fields:
         concept_label = sanitize_cypher_label(chain_fields[0].field_name.capitalize())
     elif code_fields:
@@ -438,12 +438,12 @@ def _build_graph_payload(
     else:
         concept_label = "Concept"  # Fallback
 
-    # Constrói mapa de relações para lookup rápido
+    # Build relations map for quick lookup
     relation_definitions: Dict[str, str] = {}
     for cf in chain_fields:
         relation_definitions.update(cf.relations)
 
-    # Extrai nomes dos campos CODE para busca no corpus
+    # Extract CODE field names for corpus search
     code_field_names = [cf.field_name for cf in code_fields]
 
     concepts = _extract_concepts(ontology, scalar_fields, graph_fields, value_maps)
@@ -469,7 +469,7 @@ def _build_graph_payload(
 
 
 def _index_to_label(value: Any, value_map: List[Dict[str, Any]]) -> str:
-    """Converte índice numérico para label usando o mapeamento de valores."""
+    """Converts numeric index to label using the value mapping."""
     if isinstance(value, int):
         for entry in value_map:
             if entry.get("index") == value:
@@ -484,7 +484,7 @@ def _extract_concepts(
     graph_fields: List[str],
     value_maps: Dict[str, List[Dict[str, Any]]]
 ) -> List[Dict[str, Any]]:
-    """Extrai conceitos da ontologia com propriedades e relações."""
+    """Extracts concepts from ontology with properties and relations."""
     concepts = []
 
     for name, entry in ontology.items():
@@ -503,14 +503,14 @@ def _extract_concepts(
         for gf in graph_fields:
             if gf in fields:
                 raw_val = fields[gf]
-                # Converte valor para label se houver mapeamento
+                # Convert value to label if mapping exists
                 if gf in value_maps:
                     if isinstance(raw_val, list):
                         relations[gf] = [_index_to_label(v, value_maps[gf]) for v in raw_val]
                     else:
                         relations[gf] = [_index_to_label(raw_val, value_maps[gf])]
                 else:
-                    # Sem mapeamento, usa valor direto
+                    # No mapping, use value directly
                     relations[gf] = raw_val if isinstance(raw_val, list) else [raw_val]
 
         concepts.append({"props": props, "relations": relations})
@@ -531,11 +531,11 @@ def _extract_corpus_data(
     List[Dict[str, Any]]   # from_source
 ]:
     """
-    Extrai sources, itens e relacionamentos do corpus.
+    Extracts sources, items and relationships from corpus.
 
-    Suporta dois padrões de template:
-    - CHAIN: triplas (source, relation, target) com note como descrição
-    - CODE: lista de códigos referenciando conceitos
+    Supports two template patterns:
+    - CHAIN: triples (source, relation, target) with note as description
+    - CODE: list of codes referencing concepts
     """
     sources: List[Dict[str, Any]] = []
     items: List[Dict[str, Any]] = []
@@ -548,7 +548,7 @@ def _extract_corpus_data(
         source_ref = corpus_item["source_ref"].lstrip("@")
         corpus_id = corpus_item["id"]
 
-        # Extrai source (bloco SOURCE...END SOURCE)
+        # Extract source (SOURCE...END SOURCE block)
         if source_ref not in seen_refs:
             source_props = _build_source_props(source_ref, corpus_item, bibliography)
             sources.append(source_props)
@@ -556,12 +556,12 @@ def _extract_corpus_data(
 
         data = corpus_item["data"]
 
-        # Detecta padrão do template
+        # Detect template pattern
         has_chain = "chain" in data and data["chain"]
         has_code = any(cf in data and data[cf] for cf in code_field_names)
 
         if has_chain:
-            # Padrão CHAIN (bibliometrics): bundles de note/chain
+            # CHAIN pattern (bibliometrics): note/chain bundles
             notes = data.get("note", [])
             chain_list = data.get("chain", [])
 
@@ -581,7 +581,7 @@ def _extract_corpus_data(
                     mentions.append({"item_id": item_id, "concept": src, "order": 1})
                     mentions.append({"item_id": item_id, "concept": tgt, "order": 2})
 
-                    # Normaliza tipo de relação e busca descrição
+                    # Normalize relation type and lookup description
                     rel_type = rel.upper().replace(" ", "_").replace("-", "_")
                     rel_description = relation_definitions.get(rel, "")
 
@@ -594,8 +594,8 @@ def _extract_corpus_data(
                     })
 
         elif has_code:
-            # Padrão CODE (gestao_fe): bundles de code fields
-            # Encontra o primeiro CODE field com dados
+            # CODE pattern (gestao_fe): code field bundles
+            # Find the first CODE field with data
             code_field = next((cf for cf in code_field_names if cf in data and data[cf]), None)
             if not code_field:
                 continue
@@ -604,12 +604,12 @@ def _extract_corpus_data(
             if not isinstance(code_list, list):
                 code_list = [code_list]
 
-            # Extrai descrições se disponíveis (campo bundled correspondente)
+            # Extract descriptions if available (corresponding bundled field)
             descriptions = data.get("justificativa_interna", []) or data.get("descricao", [])
             if not isinstance(descriptions, list):
                 descriptions = [descriptions] * len(code_list)
 
-            # Extrai texto base (primeiro campo MEMO ou TEXT encontrado)
+            # Extract base text (first MEMO or TEXT field found)
             base_text = ""
             for field_name in ["ordem_1a", "text", "citation"]:
                 if field_name in data and data[field_name]:
@@ -637,7 +637,7 @@ def _build_source_props(
     item: Dict[str, Any],
     bibliography: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Constrói propriedades de um nó Source (bloco SOURCE...END SOURCE)."""
+    """Builds properties of a Source node (SOURCE...END SOURCE block)."""
     bib_entry = bibliography.get(source_ref, {})
     source_meta = item.get("source_metadata", {})
 
@@ -655,75 +655,75 @@ def _build_source_props(
 
 
 # ============================================================================
-# SINCRONIZAÇÃO NEO4J
+# NEO4J SYNCHRONIZATION
 # ============================================================================
 def clear_database(session: Any) -> None:
     """
-    Limpa todos os dados do banco, incluindo constraints e indexes.
+    Clears all data from the database, including constraints and indexes.
 
-    Garante que a fonte de verdade seja sempre os dados do compilador.
+    Ensures that the source of truth is always the compiler data.
     """
-    # Remove todas as constraints existentes
+    # Remove all existing constraints
     constraints = session.run("SHOW CONSTRAINTS").data()
     for c in constraints:
         constraint_name = c.get("name")
         if constraint_name:
             session.run(f"DROP CONSTRAINT {constraint_name} IF EXISTS")
 
-    # Remove todos os indexes existentes (exceto os criados automaticamente)
+    # Remove all existing indexes (except automatically created ones)
     indexes = session.run("SHOW INDEXES").data()
     for idx in indexes:
-        if idx.get("owningConstraint") is None:  # Não é index de constraint
+        if idx.get("owningConstraint") is None:  # Not a constraint index
             idx_name = idx.get("name")
             if idx_name:
                 session.run(f"DROP INDEX {idx_name} IF EXISTS")
 
-    # Limpa todos os nodes e relacionamentos
+    # Clear all nodes and relationships
     session.run("MATCH (n) DETACH DELETE n")
 
 
 def sync_to_neo4j(session: Any, payload: GraphPayload) -> Optional[SyncError]:
     """
-    Sincroniza payload com Neo4j em transação única.
+    Synchronizes payload with Neo4j in a single transaction.
 
-    Limpa o banco completamente antes de sincronizar, garantindo que
-    o compilador seja a fonte de verdade.
+    Clears the database completely before synchronizing, ensuring that
+    the compiler is the source of truth.
 
     Args:
-        session: Sessão Neo4j ativa
-        payload: Dados preparados para persistência
+        session: Active Neo4j session
+        payload: Data prepared for persistence
 
     Returns:
-        None em sucesso, SyncError em falha.
+        None on success, SyncError on failure.
     """
     try:
-        # Limpa banco antes de sincronizar (fonte de verdade = compilador)
+        # Clear database before synchronizing (source of truth = compiler)
         clear_database(session)
         _create_constraints(session, payload.graph_fields, payload.concept_label)
         _execute_sync_transaction(session, payload)
         return None
     except Exception as e:
         return SyncError(
-            message="Falha na sincronização",
+            message="Synchronization failed",
             stage="sync",
             details=str(e)
         )
 
 
 def _create_constraints(session: Any, graph_fields: List[str], concept_label: str) -> None:
-    """Cria constraints de unicidade no schema do Neo4j."""
-    # Constraints para taxonomias dinâmicas
+    """Creates uniqueness constraints in Neo4j schema."""
+    # Constraints for dynamic taxonomies
     for label in get_taxonomy_labels(graph_fields):
         if validate_cypher_label(label):
             session.run(
                 f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.name IS UNIQUE"
             )
 
-    # Constraints fixas
+    # Fixed constraints
     session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (s:Source) REQUIRE s.bibtex IS UNIQUE")
     session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (i:Item) REQUIRE i.item_id IS UNIQUE")
 
-    # Constraint para label dinâmico (baseado no campo CHAIN/CODE)
+    # Constraint for dynamic label (based on CHAIN/CODE field)
     if validate_cypher_label(concept_label):
         session.run(
             f"CREATE CONSTRAINT IF NOT EXISTS FOR (c:{concept_label}) REQUIRE c.name IS UNIQUE"
@@ -731,7 +731,7 @@ def _create_constraints(session: Any, graph_fields: List[str], concept_label: st
 
 
 def _execute_sync_transaction(session: Any, payload: GraphPayload) -> None:
-    """Executa todas as operações de sync em uma única transação."""
+    """Executes all sync operations in a single transaction."""
     with session.begin_transaction() as tx:
         _sync_sources(tx, payload.sources)
         _sync_items(tx, payload.items)
@@ -743,7 +743,7 @@ def _execute_sync_transaction(session: Any, payload: GraphPayload) -> None:
 
 
 def _sync_sources(tx: Any, sources: List[Dict[str, Any]]) -> None:
-    """Sincroniza nós Source (correspondente ao bloco SOURCE...END SOURCE)."""
+    """Synchronizes Source nodes (corresponding to SOURCE...END SOURCE block)."""
     if not sources:
         return
     tx.run("""
@@ -764,7 +764,7 @@ def _sync_items(tx: Any, items: List[Dict[str, Any]]) -> None:
 
 
 def _sync_from_source(tx: Any, from_source: List[Dict[str, Any]]) -> None:
-    """Conecta Item ao Source de onde foi extraído."""
+    """Connects Item to the Source from which it was extracted."""
     if not from_source:
         return
     tx.run("""
@@ -775,7 +775,7 @@ def _sync_from_source(tx: Any, from_source: List[Dict[str, Any]]) -> None:
     """, rows=from_source)
 
 
-# Mapeamento de campos para nomes de relação semânticos
+# Mapping of fields to semantic relationship names
 TAXONOMY_RELATION_MAP: Dict[str, str] = {
     "topic": "GROUPED_BY",
     "aspect": "QUALIFIED_BY",
@@ -785,7 +785,7 @@ TAXONOMY_RELATION_MAP: Dict[str, str] = {
 
 
 def _get_taxonomy_relation(field_name: str) -> str:
-    """Retorna nome de relação semântico para o campo, ou HAS_* como fallback."""
+    """Returns semantic relationship name for the field, or HAS_* as fallback."""
     return TAXONOMY_RELATION_MAP.get(field_name.lower(), f"HAS_{field_name.upper()}")
 
 
@@ -796,12 +796,12 @@ def _sync_taxonomies(
     concept_label: str
 ) -> None:
     """
-    Cria nós de taxonomia e relacionamentos semânticos a partir dos nós de conceito.
+    Creates taxonomy nodes and semantic relationships from concept nodes.
 
-    Relações:
-    - Conceito -> Topic via GROUPED_BY
-    - Conceito -> Aspect via QUALIFIED_BY
-    - Conceito -> Dimension via BELONGS_TO
+    Relations:
+    - Concept -> Topic via GROUPED_BY
+    - Concept -> Aspect via QUALIFIED_BY
+    - Concept -> Dimension via BELONGS_TO
     - Topic -> Topic via IS_LINKED_TO (self-referential)
     - Topic -> Aspect via MAPPED_TO_ASPECT
     - Topic -> Dimension via MAPPED_TO_DIMENSION
@@ -809,7 +809,7 @@ def _sync_taxonomies(
     if not concepts:
         return
 
-    # Primeiro: cria nodes de taxonomia e relações Conceito -> Taxonomia
+    # First: create taxonomy nodes and Concept -> Taxonomy relations
     for field_name in graph_fields:
         label = sanitize_cypher_label(field_name.capitalize())
         rel_type = _get_taxonomy_relation(field_name)
@@ -828,7 +828,7 @@ def _sync_taxonomies(
         """
         tx.run(query, rows=concepts)
 
-    # Segundo: cria relações de mapeamento entre taxonomias
+    # Second: create mapping relations between taxonomies
     # Topic -> Aspect (MAPPED_TO_ASPECT)
     if "topic" in graph_fields and "aspect" in graph_fields:
         tx.run("""
@@ -855,8 +855,8 @@ def _sync_taxonomies(
             MERGE (topic)-[:MAPPED_TO_DIMENSION]->(dimension)
         """, rows=concepts)
 
-    # Topic -> Topic (IS_LINKED_TO) - conecta tópicos via RELATES_TO entre seus conceitos
-    # strength = número de relações RELATES_TO entre conceitos dos dois tópicos
+    # Topic -> Topic (IS_LINKED_TO) - connects topics via RELATES_TO between their concepts
+    # strength = number of RELATES_TO relations between concepts of both topics
     if "topic" in graph_fields:
         tx.run(f"""
             MATCH (t1:Topic)<-[:GROUPED_BY]-(f1:{concept_label})-[:RELATES_TO]->(f2:{concept_label})-[:GROUPED_BY]->(t2:Topic)
@@ -868,7 +868,7 @@ def _sync_taxonomies(
 
 
 def _sync_mentions(tx: Any, mentions: List[Dict[str, Any]], concept_label: str) -> None:
-    """Conecta Item aos nós de conceito mencionados."""
+    """Connects Item to mentioned concept nodes."""
     if not mentions:
         return
     tx.run(f"""
@@ -882,16 +882,16 @@ def _sync_mentions(tx: Any, mentions: List[Dict[str, Any]], concept_label: str) 
 
 def _sync_concepts(tx: Any, chains: List[Dict[str, Any]], concepts: List[Dict[str, Any]], concept_label: str) -> None:
     """
-    Cria nós de conceito (label dinâmico baseado no campo CHAIN/CODE) e relações RELATES_TO.
+    Creates concept nodes (dynamic label based on CHAIN/CODE field) and RELATES_TO relations.
 
-    Os nós são criados a partir de:
-    1. Conceitos da ontologia (sempre)
-    2. Source/target de chains (quando existem)
+    Nodes are created from:
+    1. Ontology concepts (always)
+    2. Source/target from chains (when they exist)
 
-    A relação RELATES_TO conecta conceitos com type e description como
-    atributos da aresta (apenas para templates com CHAIN field).
+    The RELATES_TO relation connects concepts with type and description as
+    edge attributes (only for templates with CHAIN field).
     """
-    # Primeiro: cria nós de conceito a partir da ontologia
+    # First: create concept nodes from ontology
     if concepts:
         tx.run(f"""
             UNWIND $rows AS row
@@ -899,18 +899,18 @@ def _sync_concepts(tx: Any, chains: List[Dict[str, Any]], concepts: List[Dict[st
             SET c += row.props
         """, rows=concepts)
 
-    # Se não há chains, não há mais nada a fazer
+    # If there are no chains, nothing more to do
     if not chains:
         return
 
-    # Segundo: cria nós de conceito de chains que não existem na ontologia
+    # Second: create concept nodes from chains that don't exist in ontology
     tx.run(f"""
         UNWIND $rows AS row
         MERGE (s:{concept_label} {{name: row.source}})
         MERGE (t:{concept_label} {{name: row.target}})
     """, rows=chains)
 
-    # Terceiro: cria relações RELATES_TO com atributos
+    # Third: create RELATES_TO relations with attributes
     tx.run(f"""
         UNWIND $rows AS row
         MATCH (s:{concept_label} {{name: row.source}})
@@ -923,10 +923,10 @@ def _sync_concepts(tx: Any, chains: List[Dict[str, Any]], concepts: List[Dict[st
 
 
 # ============================================================================
-# MÉTRICAS DE GRAFO
+# GRAPH METRICS
 # ============================================================================
 def _is_gds_available(session: Any) -> bool:
-    """Verifica se o plugin GDS está instalado."""
+    """Checks if the GDS plugin is installed."""
     try:
         result = session.run("RETURN gds.version() AS version")
         version = result.single()["version"]
@@ -938,12 +938,12 @@ def _is_gds_available(session: Any) -> bool:
 
 def _get_graph_strategy(payload: GraphPayload) -> str:
     """
-    Determina a estratégia de grafo para métricas GDS.
+    Determines the graph strategy for GDS metrics.
 
-    Hierarquia de preferência:
-    1. RELATES_TO - relação explícita (templates CHAIN)
-    2. CO_TAXONOMY - co-taxonomia ponderada (templates CODE com TOPIC)
-    3. CO_CITATION - co-citação via Source (fallback)
+    Preference hierarchy:
+    1. RELATES_TO - explicit relation (CHAIN templates)
+    2. CO_TAXONOMY - weighted co-taxonomy (CODE templates with TOPIC)
+    3. CO_CITATION - co-citation via Source (fallback)
     """
     if payload.chains:
         return "RELATES_TO"
@@ -959,56 +959,56 @@ def compute_metrics(
     reporter: TaskReporter
 ) -> None:
     """
-    Calcula métricas de grafo: nativas (Cypher) e avançadas (GDS).
+    Calculates graph metrics: native (Cypher) and advanced (GDS).
 
-    Métricas nativas são sempre calculadas.
-    Métricas GDS são calculadas se o plugin estiver disponível.
+    Native metrics are always calculated.
+    GDS metrics are calculated if the plugin is available.
     """
     concept_label = payload.concept_label
     graph_fields = payload.graph_fields
 
-    # 1. Métricas nativas (sempre executam)
-    with reporter.step("Calculando Métricas Nativas"):
+    # 1. Native metrics (always run)
+    with reporter.step("Calculating Native Metrics"):
         _compute_native_concept_metrics(session, concept_label)
         _compute_native_taxonomy_metrics(session, concept_label, graph_fields)
         _compute_native_source_metrics(session, concept_label)
 
-    # 2. Métricas GDS (opcional com fallback)
+    # 2. GDS metrics (optional with fallback)
     if not _is_gds_available(session):
         reporter.warning(
-            "GDS não instalado. Instale o plugin Graph Data Science para "
-            "métricas avançadas (PageRank, Betweenness, Comunidades)."
+            "GDS not installed. Install the Graph Data Science plugin for "
+            "advanced metrics (PageRank, Betweenness, Communities)."
         )
         return
 
     strategy = _get_graph_strategy(payload)
-    reporter.info(f"Estratégia de grafo GDS: {strategy}")
+    reporter.info(f"GDS graph strategy: {strategy}")
 
-    with reporter.step("Calculando Métricas GDS"):
+    with reporter.step("Calculating GDS Metrics"):
         try:
             _compute_gds_metrics(session, payload, strategy, reporter)
         except Exception as e:
-            reporter.warning(f"Erro ao calcular métricas GDS: {e}")
+            reporter.warning(f"Error calculating GDS metrics: {e}")
 
 
 # ----------------------------------------------------------------------------
-# MÉTRICAS NATIVAS (Cypher puro - sempre disponíveis)
+# NATIVE METRICS (Pure Cypher - always available)
 # ----------------------------------------------------------------------------
 def _compute_native_concept_metrics(session: Any, concept_label: str) -> None:
     """
-    Calcula métricas nativas para nós de conceito.
+    Calculates native metrics for concept nodes.
 
-    Métricas:
-    - degree: grau total (in + out)
-    - in_degree: relações entrando
-    - out_degree: relações saindo
-    - mention_count: Items que mencionam o conceito
-    - source_count: Sources distintos onde aparece
+    Metrics:
+    - degree: total degree (in + out)
+    - in_degree: incoming relations
+    - out_degree: outgoing relations
+    - mention_count: Items that mention the concept
+    - source_count: distinct Sources where it appears
     """
     if not validate_cypher_label(concept_label):
         return
 
-    # Degree centralidade (baseado em RELATES_TO)
+    # Degree centrality (based on RELATES_TO)
     session.run(f"""
         MATCH (c:{concept_label})
         OPTIONAL MATCH (c)-[:RELATES_TO]->(out)
@@ -1019,7 +1019,7 @@ def _compute_native_concept_metrics(session: Any, concept_label: str) -> None:
             c.degree = out_deg + in_deg
     """)
 
-    # Mention count e source count
+    # Mention count and source count
     session.run(f"""
         MATCH (c:{concept_label})
         OPTIONAL MATCH (c)<-[:MENTIONS]-(i:Item)
@@ -1036,13 +1036,13 @@ def _compute_native_taxonomy_metrics(
     graph_fields: List[str]
 ) -> None:
     """
-    Calcula métricas nativas para nós de taxonomia (Topic, Aspect, Dimension, etc).
+    Calculates native metrics for taxonomy nodes (Topic, Aspect, Dimension, etc).
 
-    Métricas:
-    - concept_count: conceitos classificados
-    - weighted_degree: soma dos strengths das IS_LINKED_TO (se existir)
-    - aspect_diversity: aspectos distintos (se Topic)
-    - dimension_diversity: dimensões distintas (se Topic)
+    Metrics:
+    - concept_count: classified concepts
+    - weighted_degree: sum of IS_LINKED_TO strengths (if exists)
+    - aspect_diversity: distinct aspects (if Topic)
+    - dimension_diversity: distinct dimensions (if Topic)
     """
     if not validate_cypher_label(concept_label):
         return
@@ -1061,9 +1061,9 @@ def _compute_native_taxonomy_metrics(
             SET t.concept_count = cnt
         """)
 
-    # Métricas específicas para Topic (se existir)
+    # Topic-specific metrics (if exists)
     if "topic" in graph_fields:
-        # Weighted degree (soma dos strengths das IS_LINKED_TO)
+        # Weighted degree (sum of IS_LINKED_TO strengths)
         session.run("""
             MATCH (t:Topic)
             OPTIONAL MATCH (t)-[r:IS_LINKED_TO]-()
@@ -1071,7 +1071,7 @@ def _compute_native_taxonomy_metrics(
             SET t.weighted_degree = wd
         """)
 
-        # Aspect diversity (se aspect existir)
+        # Aspect diversity (if aspect exists)
         if "aspect" in graph_fields:
             session.run(f"""
                 MATCH (t:Topic)<-[:GROUPED_BY]-(c:{concept_label})
@@ -1080,7 +1080,7 @@ def _compute_native_taxonomy_metrics(
                 SET t.aspect_diversity = div
             """)
 
-        # Dimension diversity (se dimension existir)
+        # Dimension diversity (if dimension exists)
         if "dimension" in graph_fields:
             session.run(f"""
                 MATCH (t:Topic)<-[:GROUPED_BY]-(c:{concept_label})
@@ -1092,11 +1092,11 @@ def _compute_native_taxonomy_metrics(
 
 def _compute_native_source_metrics(session: Any, concept_label: str) -> None:
     """
-    Calcula métricas nativas para nós Source.
+    Calculates native metrics for Source nodes.
 
-    Métricas:
-    - item_count: Items extraídos da fonte
-    - concept_count: conceitos mencionados
+    Metrics:
+    - item_count: Items extracted from the source
+    - concept_count: mentioned concepts
     """
     if not validate_cypher_label(concept_label):
         return
@@ -1112,7 +1112,7 @@ def _compute_native_source_metrics(session: Any, concept_label: str) -> None:
 
 
 # ----------------------------------------------------------------------------
-# MÉTRICAS GDS (requer plugin Graph Data Science)
+# GDS METRICS (requires Graph Data Science plugin)
 # ----------------------------------------------------------------------------
 def _compute_gds_metrics(
     session: Any,
@@ -1121,60 +1121,60 @@ def _compute_gds_metrics(
     reporter: TaskReporter
 ) -> None:
     """
-    Calcula métricas GDS (PageRank, Betweenness, Louvain).
+    Calculates GDS metrics (PageRank, Betweenness, Louvain).
 
-    A projeção do grafo depende da estratégia:
-    - RELATES_TO: usa relação explícita
-    - CO_TAXONOMY: usa co-taxonomia ponderada
-    - CO_CITATION: usa co-citação via Source
+    Graph projection depends on strategy:
+    - RELATES_TO: uses explicit relation
+    - CO_TAXONOMY: uses weighted co-taxonomy
+    - CO_CITATION: uses co-citation via Source
     """
     concept_label = payload.concept_label
     graph_name = "synesis_metrics_graph"
 
-    # Limpa projeção anterior se existir
+    # Clear previous projection if exists
     _drop_gds_graph(session, graph_name)
 
-    # Cria projeção baseada na estratégia
+    # Create projection based on strategy
     node_count, rel_count = _create_gds_projection(
         session, graph_name, payload, strategy
     )
 
     if node_count == 0 or rel_count == 0:
-        reporter.warning("Grafo vazio - pulando métricas GDS")
+        reporter.warning("Empty graph - skipping GDS metrics")
         return
 
-    reporter.info(f"Projeção GDS: {node_count} nós, {rel_count} relações")
+    reporter.info(f"GDS projection: {node_count} nodes, {rel_count} relationships")
 
-    # Calcula métricas
+    # Calculate metrics
     try:
         _run_pagerank(session, graph_name, concept_label)
-        reporter.success("PageRank calculado")
+        reporter.success("PageRank calculated")
     except Exception as e:
-        reporter.warning(f"PageRank falhou: {e}")
+        reporter.warning(f"PageRank failed: {e}")
 
     try:
-        # Betweenness pode ser lento em grafos grandes
+        # Betweenness can be slow on large graphs
         _run_betweenness(session, graph_name, concept_label)
-        reporter.success("Betweenness calculado")
+        reporter.success("Betweenness calculated")
     except Exception as e:
-        reporter.warning(f"Betweenness falhou: {e}")
+        reporter.warning(f"Betweenness failed: {e}")
 
     try:
         _run_louvain(session, graph_name, concept_label)
-        reporter.success("Comunidades (Louvain) calculadas")
+        reporter.success("Communities (Louvain) calculated")
     except Exception as e:
-        reporter.warning(f"Louvain falhou: {e}")
+        reporter.warning(f"Louvain failed: {e}")
 
-    # Limpa projeção
+    # Clear projection
     _drop_gds_graph(session, graph_name)
 
 
 def _drop_gds_graph(session: Any, graph_name: str) -> None:
-    """Remove projeção GDS se existir."""
+    """Removes GDS projection if exists."""
     try:
         session.run(f"CALL gds.graph.drop('{graph_name}', false)")
     except Exception:
-        pass  # Ignora se não existir
+        pass  # Ignore if doesn't exist
 
 
 def _create_gds_projection(
@@ -1184,15 +1184,15 @@ def _create_gds_projection(
     strategy: str
 ) -> tuple[int, int]:
     """
-    Cria projeção GDS baseada na estratégia.
+    Creates GDS projection based on strategy.
 
     Returns:
-        Tupla (node_count, relationship_count)
+        Tuple (node_count, relationship_count)
     """
     concept_label = payload.concept_label
 
     if strategy == "RELATES_TO":
-        # Projeção nativa - mais eficiente
+        # Native projection - more efficient
         result = session.run(f"""
             CALL gds.graph.project(
                 '{graph_name}',
@@ -1204,8 +1204,8 @@ def _create_gds_projection(
         """)
 
     elif strategy == "CO_TAXONOMY":
-        # Projeção via co-taxonomia ponderada
-        # Constrói lista de relações de taxonomia dinamicamente
+        # Projection via weighted co-taxonomy
+        # Build taxonomy relations list dynamically
         taxonomy_rels = []
         for field_name in payload.graph_fields:
             rel_type = _get_taxonomy_relation(field_name)
@@ -1231,7 +1231,7 @@ def _create_gds_projection(
         """)
 
     else:  # CO_CITATION
-        # Projeção via co-citação (Source)
+        # Projection via co-citation (Source)
         result = session.run(f"""
             CALL gds.graph.project.cypher(
                 '{graph_name}',
@@ -1251,7 +1251,7 @@ def _create_gds_projection(
 
 
 def _run_pagerank(session: Any, graph_name: str, concept_label: str) -> None:
-    """Executa PageRank e persiste nos nós."""
+    """Executes PageRank and persists in nodes."""
     session.run(f"""
         CALL gds.pageRank.stream('{graph_name}')
         YIELD nodeId, score
@@ -1262,7 +1262,7 @@ def _run_pagerank(session: Any, graph_name: str, concept_label: str) -> None:
 
 
 def _run_betweenness(session: Any, graph_name: str, concept_label: str) -> None:
-    """Executa Betweenness Centrality e persiste nos nós."""
+    """Executes Betweenness Centrality and persists in nodes."""
     session.run(f"""
         CALL gds.betweenness.stream('{graph_name}')
         YIELD nodeId, score
@@ -1273,7 +1273,7 @@ def _run_betweenness(session: Any, graph_name: str, concept_label: str) -> None:
 
 
 def _run_louvain(session: Any, graph_name: str, concept_label: str) -> None:
-    """Executa Louvain (community detection) e persiste nos nós."""
+    """Executes Louvain (community detection) and persists in nodes."""
     session.run(f"""
         CALL gds.louvain.stream('{graph_name}')
         YIELD nodeId, communityId
@@ -1284,11 +1284,11 @@ def _run_louvain(session: Any, graph_name: str, concept_label: str) -> None:
 
 
 # ============================================================================
-# CONFIGURAÇÃO
+# CONFIGURATION
 # ============================================================================
 @dataclass
 class Neo4jConfig:
-    """Configuração de conexão Neo4j."""
+    """Neo4j connection configuration."""
     uri: str
     user: str
     password: str
@@ -1296,17 +1296,17 @@ class Neo4jConfig:
 
 
 def load_config(config_path: Path) -> Union[Neo4jConfig, ConnectionError]:
-    """Carrega configuração Neo4j do arquivo TOML."""
+    """Loads Neo4j configuration from TOML file."""
     if not config_path.exists():
         return ConnectionError(
-            message="Arquivo de configuração não encontrado",
+            message="Configuration file not found",
             stage="config",
             details=str(config_path)
         )
 
     try:
         cfg = tomllib.loads(config_path.read_text("utf-8"))["neo4j"]
-        # Aceita tanto 'uri' quanto 'URI'
+        # Accept both 'uri' and 'URI'
         uri = cfg.get("uri") or cfg.get("URI")
         if not uri:
             raise KeyError("'uri'")
@@ -1318,67 +1318,67 @@ def load_config(config_path: Path) -> Union[Neo4jConfig, ConnectionError]:
         )
     except KeyError as e:
         return ConnectionError(
-            message="Configuração incompleta",
+            message="Incomplete configuration",
             stage="config",
-            details=f"Campo obrigatório ausente: {e}"
+            details=f"Required field missing: {e}"
         )
     except Exception as e:
         return ConnectionError(
-            message="Erro ao ler configuração",
+            message="Error reading configuration",
             stage="config",
             details=str(e)
         )
 
 
 # ============================================================================
-# CRIAÇÃO DE BANCO DE DADOS
+# DATABASE CREATION
 # ============================================================================
 def ensure_database_exists(driver: Any, database_name: str, reporter: TaskReporter) -> Optional[SyncError]:
     """
-    Cria o banco de dados se não existir.
+    Creates the database if it doesn't exist.
 
-    Neo4j Community Edition só suporta um banco, então falha silenciosamente se não suportar.
-    Neo4j Enterprise/Aura suportam múltiplos bancos.
+    Neo4j Community Edition only supports one database, so it fails silently if not supported.
+    Neo4j Enterprise/Aura support multiple databases.
     """
     safe_name = sanitize_database_name(database_name)
 
     try:
         with driver.session(database="system") as session:
-            # Verifica se o banco existe
+            # Check if database exists
             result = session.run("SHOW DATABASES")
             existing = {record["name"] for record in result}
 
             if safe_name not in existing:
-                reporter.info(f"Criando banco de dados: {safe_name}")
+                reporter.info(f"Creating database: {safe_name}")
                 session.run(f"CREATE DATABASE `{safe_name}` IF NOT EXISTS")
-                # Aguarda o banco ficar disponível
+                # Wait for database to become available
                 import time as _time
                 _time.sleep(2)
             else:
-                reporter.info(f"Banco de dados já existe: {safe_name}")
+                reporter.info(f"Database already exists: {safe_name}")
         return None
     except Exception as e:
-        # Se falhar (ex: Community Edition), tenta usar o banco padrão
+        # If fails (e.g.: Community Edition), try using default database
         error_msg = str(e)
         if "Unsupported" in error_msg or "not supported" in error_msg.lower():
-            reporter.warning(f"Multi-database não suportado. Usando banco padrão.")
+            reporter.warning(f"Multi-database not supported. Using default database.")
             return None
         return SyncError(
-            message="Falha ao criar banco de dados",
+            message="Failed to create database",
             stage="database_setup",
             details=error_msg
         )
 
 
 def get_database_name_from_project(json_data: Dict[str, Any]) -> str:
-    """Extrai nome do projeto para usar como nome do banco."""
+    """Extracts project name to use as database name."""
     project_name = json_data.get("project", {}).get("name", "synesis")
-    # Sanitiza para nome de banco válido (Neo4j só aceita letras, números, pontos e hífens)
+    # Sanitize to valid database name (Neo4j only accepts letters, numbers, dots and hyphens)
     return sanitize_database_name(project_name)
 
 
 # ============================================================================
-# PIPELINE PRINCIPAL
+# MAIN PIPELINE
 # ============================================================================
 def run_pipeline(
     project_path: Path,
@@ -1386,79 +1386,79 @@ def run_pipeline(
     reporter: TaskReporter
 ) -> PipelineResult:
     """
-    Executa pipeline completo: compilação → conexão → sincronização.
+    Executes complete pipeline: compilation → connection → synchronization.
 
     Args:
-        project_path: Caminho para projeto .synp
-        config_path: Caminho para config.toml
-        reporter: Reporter para feedback visual
+        project_path: Path to .synp project
+        config_path: Path to config.toml
+        reporter: Reporter for visual feedback
 
     Returns:
-        PipelineResult indicando sucesso ou erro tipado.
+        PipelineResult indicating success or typed error.
     """
-    # 1. Validação de entrada
+    # 1. Input validation
     if not project_path.exists():
         return PipelineResult(
             success=False,
             error=CompilationError(
-                message="Projeto não encontrado",
+                message="Project not found",
                 stage="validation",
                 details=str(project_path)
             )
         )
 
-    # 2. Compilação
-    with reporter.step("Compilando Projeto (In-Memory)"):
+    # 2. Compilation
+    with reporter.step("Compiling Project (In-Memory)"):
         compile_result = compile_project(project_path, reporter)
         if isinstance(compile_result, CompilationError):
             reporter.print_diagnostics(compile_result.diagnostics)
             return PipelineResult(success=False, error=compile_result)
         payload = compile_result
 
-    # 3. Configuração
-    with reporter.step("Carregando Configuração"):
+    # 3. Configuration
+    with reporter.step("Loading Configuration"):
         config_result = load_config(config_path)
         if isinstance(config_result, ConnectionError):
             return PipelineResult(success=False, error=config_result)
         config = config_result
 
-    # 4. Sincronização
+    # 4. Synchronization
     if GraphDatabase is None:
         return PipelineResult(
             success=False,
             error=ConnectionError(
-                message="Driver Neo4j não instalado",
+                message="Neo4j driver not installed",
                 stage="connection",
                 details="pip install neo4j"
             )
         )
 
-    # Nome do banco baseado no projeto
+    # Database name based on project
     db_name = sanitize_database_name(payload.project_name)
-    reporter.info(f"Banco de dados alvo: {db_name}")
+    reporter.info(f"Target database: {db_name}")
 
     try:
         with GraphDatabase.driver(config.uri, auth=(config.user, config.password)) as driver:
-            # 4a. Cria banco se necessário
-            with reporter.step("Verificando/Criando Banco de Dados"):
+            # 4a. Create database if needed
+            with reporter.step("Checking/Creating Database"):
                 db_error = ensure_database_exists(driver, db_name, reporter)
                 if db_error:
                     return PipelineResult(success=False, error=db_error)
 
-            # 4b. Sincroniza dados
+            # 4b. Synchronize data
             with driver.session(database=db_name) as session:
-                with reporter.step("Sincronizando Grafo (Transacional)"):
+                with reporter.step("Synchronizing Graph (Transactional)"):
                     sync_error = sync_to_neo4j(session, payload)
                     if sync_error:
                         return PipelineResult(success=False, error=sync_error)
 
-                # 4c. Calcula métricas de grafo
+                # 4c. Calculate graph metrics
                 compute_metrics(session, payload, reporter)
     except Exception as e:
         return PipelineResult(
             success=False,
             error=ConnectionError(
-                message="Falha na conexão com Neo4j",
+                message="Failed to connect to Neo4j",
                 stage="connection",
                 details=str(e)
             )

@@ -288,7 +288,7 @@ graph TD
     classDef files fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
     classDef engine fill:#fff3e0,stroke:#ff6f00,stroke-width:2px;
     classDef data fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
-    classDef graph fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef graphDb fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
     classDef agent fill:#212121,stroke:#000,stroke-width:2px,color:#fff;
 
     subgraph "1. Entrada: Pesquisa como Código"
@@ -318,9 +318,9 @@ graph TD
     end
 
     subgraph "4. Grafo de Conhecimento"
-        NEO4J[(Neo4j)]:::graph
-        NATIVE[Métricas Nativas<br/>Cypher]:::graph
-        GDS[Métricas GDS<br/>Opcional]:::graph
+        NEO4J[(Neo4j)]:::graphDb
+        NATIVE[Métricas Nativas<br/>Cypher]:::graphDb
+        GDS[Métricas GDS<br/>Opcional]:::graphDb
 
         JSON & SCHEMA -->|Sync| NEO4J
         NEO4J --> NATIVE

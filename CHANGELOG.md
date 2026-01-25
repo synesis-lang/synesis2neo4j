@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.1] - 2025-01-25
+
+### Fixed
+
+#### GDS Compatibility (Neo4j GDS 2.x+)
+- **gds.graph.drop:** Added `YIELD graphName` to avoid deprecated `schema` field warning
+- **gds.graph.project.cypher:** Replaced deprecated procedure with new aggregation function API
+  - CO_TAXONOMY strategy now uses inline `gds.graph.project()` aggregation
+  - CO_CITATION strategy now uses inline `gds.graph.project()` aggregation
+  - More efficient execution within Cypher flow
+
+---
+
 ## [0.1.0] - 2025-01-24
 
 ### Added

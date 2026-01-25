@@ -19,5 +19,5 @@
 
 uri = "bolt://127.0.0.1:7687"
 user = "neo4j"
-password = "YOUR_PASSWORD_HERE"
-# database = "neo4j"  # Optional: overrides project-based naming
+password = "YOUR_PASSWORD"
+# database = "YOUR_DATABASE_NAME"  # Optional: overrides project-based naming

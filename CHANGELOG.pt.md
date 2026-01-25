@@ -11,6 +11,19 @@ e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR
 
 ---
 
+## [0.1.1] - 2025-01-25
+
+### Corrigido
+
+#### Compatibilidade GDS (Neo4j GDS 2.x+)
+- **gds.graph.drop:** Adicionado `YIELD graphName` para evitar warning do campo `schema` depreciado
+- **gds.graph.project.cypher:** Substituída procedure depreciada pela nova API de função de agregação
+  - Estratégia CO_TAXONOMY agora usa `gds.graph.project()` inline como agregação
+  - Estratégia CO_CITATION agora usa `gds.graph.project()` inline como agregação
+  - Execução mais eficiente dentro do fluxo Cypher
+
+---
+
 ## [0.1.0] - 2025-01-24
 
 ### Adicionado

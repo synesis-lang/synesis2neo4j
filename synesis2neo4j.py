@@ -50,8 +50,8 @@ from typing import Any, Dict, List, Optional, Union
 # ============================================================================
 # VERSION
 # ============================================================================
-__version__ = "0.1.0"
-__version_info__ = (0, 1, 0)
+__version__ = "0.1.1"
+__version_info__ = (0, 1, 1)
 
 # ============================================================================
 # EXTERNAL IMPORTS
@@ -1172,7 +1172,8 @@ def _compute_gds_metrics(
 def _drop_gds_graph(session: Any, graph_name: str) -> None:
     """Removes GDS projection if exists."""
     try:
-        session.run(f"CALL gds.graph.drop('{graph_name}', false)")
+        # Use YIELD graphName to avoid deprecated 'schema' field warning
+        session.run(f"CALL gds.graph.drop('{graph_name}', false) YIELD graphName")
     except Exception:
         pass  # Ignore if doesn't exist
 
@@ -1185,6 +1186,9 @@ def _create_gds_projection(
 ) -> tuple[int, int]:
     """
     Creates GDS projection based on strategy.
+
+    Uses the new gds.graph.project aggregation function API (GDS 2.x+)
+    instead of the deprecated gds.graph.project.cypher procedure.
 
     Returns:
         Tuple (node_count, relationship_count)
@@ -1204,7 +1208,7 @@ def _create_gds_projection(
         """)
 
     elif strategy == "CO_TAXONOMY":
-        # Projection via weighted co-taxonomy
+        # Projection via weighted co-taxonomy using aggregation function
         # Build taxonomy relations list dynamically
         taxonomy_rels = []
         for field_name in payload.graph_fields:
@@ -1217,33 +1221,34 @@ def _create_gds_projection(
 
         rel_pattern = "|".join(taxonomy_rels)
 
+        # New aggregation function API (replaces deprecated gds.graph.project.cypher)
         result = session.run(f"""
-            CALL gds.graph.project.cypher(
+            MATCH (f1:{concept_label})-[:{rel_pattern}]->(t)<-[:{rel_pattern}]-(f2:{concept_label})
+            WHERE f1 <> f2
+            WITH f1, f2, count(DISTINCT t) AS weight
+            WITH gds.graph.project(
                 '{graph_name}',
-                'MATCH (f:{concept_label}) RETURN id(f) AS id',
-                'MATCH (f1:{concept_label})-[r1:{rel_pattern}]->(t)<-[r2:{rel_pattern}]-(f2:{concept_label})
-                 WHERE f1 <> f2
-                 WITH f1, f2, count(DISTINCT t) AS weight
-                 RETURN id(f1) AS source, id(f2) AS target, toFloat(weight) AS weight'
-            )
-            YIELD nodeCount, relationshipCount
-            RETURN nodeCount, relationshipCount
+                f1,
+                f2,
+                {{relationshipProperties: {{weight: weight}}}}
+            ) AS g
+            RETURN g.nodeCount AS nodeCount, g.relationshipCount AS relationshipCount
         """)
 
     else:  # CO_CITATION
-        # Projection via co-citation (Source)
+        # Projection via co-citation (Source) using aggregation function
         result = session.run(f"""
-            CALL gds.graph.project.cypher(
+            MATCH (f1:{concept_label})<-[:MENTIONS]-(:Item)-[:FROM_SOURCE]->(s:Source)
+                  <-[:FROM_SOURCE]-(:Item)-[:MENTIONS]->(f2:{concept_label})
+            WHERE f1 <> f2
+            WITH f1, f2, count(DISTINCT s) AS weight
+            WITH gds.graph.project(
                 '{graph_name}',
-                'MATCH (f:{concept_label}) RETURN id(f) AS id',
-                'MATCH (f1:{concept_label})<-[:MENTIONS]-(:Item)-[:FROM_SOURCE]->(s:Source)
-                       <-[:FROM_SOURCE]-(:Item)-[:MENTIONS]->(f2:{concept_label})
-                 WHERE f1 <> f2
-                 WITH f1, f2, count(DISTINCT s) AS weight
-                 RETURN id(f1) AS source, id(f2) AS target, toFloat(weight) AS weight'
-            )
-            YIELD nodeCount, relationshipCount
-            RETURN nodeCount, relationshipCount
+                f1,
+                f2,
+                {{relationshipProperties: {{weight: weight}}}}
+            ) AS g
+            RETURN g.nodeCount AS nodeCount, g.relationshipCount AS relationshipCount
         """)
 
     record = result.single()

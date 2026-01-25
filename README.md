@@ -274,8 +274,8 @@ Add to `claude_desktop_config.json`:
 ### Complete Documentation
 
 See the `mcp/` folder for:
-- [SETUP.md](mcp/SETUP.md) - Complete configuration guide
-- [QUERIES_REFERENCE.md](mcp/QUERIES_REFERENCE.md) - Cypher query reference
+- [SETUP.md](mcp/SETUP.en.md) - Complete configuration guide
+- [QUERIES_REFERENCE.md](mcp/QUERIES_REFERENCE.en.md) - Cypher query reference
 - Configuration templates for single and multiple databases
 
 ---

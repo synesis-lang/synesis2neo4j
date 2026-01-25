@@ -1,0 +1,23 @@
+# =============================================================================
+# Synesis2Neo4j Configuration
+# =============================================================================
+# This file configures the Neo4j connection for the synesis2neo4j.py pipeline.
+#
+# Usage:
+#   python synesis2neo4j.py --project ./project.synp --config config.toml
+#
+# Documentation: https://synesis-lang.github.io/synesis-docs
+# =============================================================================
+
+[neo4j]
+# Neo4j connection settings
+#
+# uri: Connection URI (bolt:// for local, neo4j+s:// for Aura)
+# user: Database username
+# password: Database password
+# database: Target database name (optional, auto-created from project name)
+
+uri = "bolt://127.0.0.1:7687"
+user = "neo4j"
+password = "YOUR_PASSWORD_HERE"
+# database = "neo4j"  # Optional: overrides project-based naming

@@ -50,13 +50,14 @@ O pipeline traduz automaticamente os tipos de campo definidos no seu **Template 
 | `ENUMERATED` | **Propriedade** | — | Valores discretos armazenados como propriedade no nó. |
 | `CHAIN` | **Relação Explícita** | `RELATES_TO` | Conexão direta entre conceitos com tipo e descrição. |
 | `TEXT` / `MEMO` | **Propriedade** | — | Texto livre armazenado como propriedade. |
+| `SCOPE SOURCE` | **Propriedade de Source** | — | Campos com `SCOPE SOURCE` são transferidos dinamicamente como propriedades do nó `Source`. |
 
 ### Nós Base (Sempre Criados)
 
 | Nó | Descrição | Propriedades |
 |----|-----------|--------------|
-| `Source` | Fonte de dados (entrevista, artigo, documento) | `id`, `title`, `type`, campos customizados |
-| `Item` | Unidade de citação extraída da fonte | `id`, `content`, `source_file`, `line` |
+| `Source` | Fonte de dados (entrevista, artigo, documento) | `bibtex`, `title`, `author`, `year` + todos os campos `SCOPE SOURCE` do Template |
+| `Item` | Unidade de citação extraída da fonte | `item_id`, `citation`, `description` |
 
 ### Exemplo de Tradução
 

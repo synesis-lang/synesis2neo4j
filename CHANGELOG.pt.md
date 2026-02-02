@@ -11,6 +11,19 @@ e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR
 
 ---
 
+## [0.1.2] - 2025-02-01
+
+### Adicionado
+
+#### Campos Dinâmicos de Source
+- **Suporte a SCOPE SOURCE:** Campos com `SCOPE SOURCE` definidos no Template (.synt) agora são transferidos dinamicamente como propriedades do nó `Source` no Neo4j
+- **Extração Guiada pelo Template:** `analyze_template()` agora identifica e cataloga campos SOURCE junto com campos ONTOLOGY e ITEM
+- **Propriedades Dinâmicas de Source:** `_build_source_props()` substituiu extração hardcoded por iteração dinâmica sobre campos SOURCE definidos no template
+- **Fluxo de Dados Completo:** Nomes dos campos SOURCE são propagados por todo o pipeline: `analyze_template()` → `GraphPayload` → `_extract_corpus_data()` → `_build_source_props()`
+- **Retrocompatibilidade:** Campos bibliográficos padrão (`title`, `author`, `year`, `doi`, `journal`, `abstract`) permanecem como fallback das entradas bibliográficas
+
+---
+
 ## [0.1.1] - 2025-01-25
 
 ### Corrigido

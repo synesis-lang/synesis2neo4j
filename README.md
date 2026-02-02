@@ -50,13 +50,14 @@ The pipeline automatically translates field types defined in your **Template (.s
 | `ENUMERATED` | **Property** | — | Discrete values stored as node property. |
 | `CHAIN` | **Explicit Relationship** | `RELATES_TO` | Direct connection between concepts with type and description. |
 | `TEXT` / `MEMO` | **Property** | — | Free text stored as property. |
+| `SCOPE SOURCE` | **Source Property** | — | Fields with `SCOPE SOURCE` are dynamically transferred as properties of the `Source` node. |
 
 ### Base Nodes (Always Created)
 
 | Node | Description | Properties |
 |------|-------------|------------|
-| `Source` | Data source (interview, article, document) | `id`, `title`, `type`, custom fields |
-| `Item` | Citation unit extracted from source | `id`, `content`, `source_file`, `line` |
+| `Source` | Data source (interview, article, document) | `bibtex`, `title`, `author`, `year` + all `SCOPE SOURCE` fields from Template |
+| `Item` | Citation unit extracted from source | `item_id`, `citation`, `description` |
 
 ### Translation Example
 

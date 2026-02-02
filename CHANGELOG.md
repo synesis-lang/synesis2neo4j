@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.2] - 2025-02-01
+
+### Added
+
+#### Dynamic Source Fields
+- **SOURCE Scope Support:** Fields with `SCOPE SOURCE` defined in the Template (.synt) are now dynamically transferred as properties of the `Source` node in Neo4j
+- **Template-Driven Extraction:** `analyze_template()` now identifies and catalogs SOURCE-scoped fields alongside ONTOLOGY and ITEM fields
+- **Dynamic Source Properties:** `_build_source_props()` replaced hardcoded field extraction with dynamic iteration over template-defined SOURCE fields
+- **Full Data Flow:** SOURCE field names are now propagated through the entire pipeline: `analyze_template()` → `GraphPayload` → `_extract_corpus_data()` → `_build_source_props()`
+- **Backward Compatibility:** Standard bibliographic fields (`title`, `author`, `year`, `doi`, `journal`, `abstract`) remain as fallback from bibliography entries
+
+---
+
 ## [0.1.1] - 2025-01-25
 
 ### Fixed

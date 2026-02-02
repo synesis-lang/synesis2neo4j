@@ -50,8 +50,8 @@ from typing import Any, Dict, List, Optional, Union
 # ============================================================================
 # VERSION
 # ============================================================================
-__version__ = "0.1.1"
-__version_info__ = (0, 1, 1)
+__version__ = "0.1.2"
+__version_info__ = (0, 1, 2)
 
 # ============================================================================
 # EXTERNAL IMPORTS
@@ -144,6 +144,7 @@ class GraphPayload:
     graph_fields: List[str]
     chain_fields: List[ChainFieldSpec]
     code_fields: List[CodeFieldSpec]
+    source_fields: List[str]  # Dynamic properties for Source nodes (SCOPE SOURCE)
     value_maps: Dict[str, List[Dict[str, Any]]]  # Mapping of indices to labels
     concepts: List[Dict[str, Any]]
     sources: List[Dict[str, Any]]  # Previously "references"
@@ -305,16 +306,17 @@ class _StepContext:
 # ============================================================================
 # TEMPLATE ANALYSIS
 # ============================================================================
-def analyze_template(template_data: Dict[str, Any]) -> tuple[List[str], List[str], List[ChainFieldSpec], List[CodeFieldSpec], Dict[str, List[Dict]]]:
+def analyze_template(template_data: Dict[str, Any]) -> tuple[List[str], List[str], List[ChainFieldSpec], List[CodeFieldSpec], Dict[str, List[Dict]], List[str]]:
     """
-    Analyzes Synesis template to identify scalar, relational, CHAIN and CODE fields.
+    Analyzes Synesis template to identify scalar, relational, CHAIN, CODE and SOURCE fields.
 
     Returns:
-        Tuple (scalar_fields, graph_fields, chain_fields, code_fields, value_maps).
+        Tuple (scalar_fields, graph_fields, chain_fields, code_fields, value_maps, source_fields).
         - graph_fields become taxonomy nodes
         - chain_fields define nodes with self-referential relations (triples)
         - code_fields define references to concepts (list of codes)
         - value_maps maps numeric indices to labels (for ORDERED/ENUMERATED)
+        - source_fields become dynamic properties on Source nodes
     """
     field_specs = template_data.get("field_specs", {})
 
@@ -323,6 +325,7 @@ def analyze_template(template_data: Dict[str, Any]) -> tuple[List[str], List[str
     chain_fields: List[ChainFieldSpec] = []
     code_fields: List[CodeFieldSpec] = []
     value_maps: Dict[str, List[Dict]] = {}
+    source_fields: List[str] = []
 
     # Iterate through all fields and filter by scope
     for field_name, spec in field_specs.items():
@@ -351,7 +354,10 @@ def analyze_template(template_data: Dict[str, Any]) -> tuple[List[str], List[str
                     description=spec.get("description", "")
                 ))
 
-    return scalar_fields, graph_fields, chain_fields, code_fields, value_maps
+        elif scope == "SOURCE":
+            source_fields.append(field_name)
+
+    return scalar_fields, graph_fields, chain_fields, code_fields, value_maps, source_fields
 
 
 def get_taxonomy_labels(graph_fields: List[str]) -> List[str]:
@@ -402,7 +408,7 @@ def compile_project(
     corpus_count = len(json_data.get("corpus", []))
     reporter.success(f"Compilation OK. {corpus_count} items processed.")
 
-    scalar_fields, graph_fields, chain_fields, code_fields, value_maps = analyze_template(json_data["template"])
+    scalar_fields, graph_fields, chain_fields, code_fields, value_maps, source_fields = analyze_template(json_data["template"])
 
     payload = _build_graph_payload(
         json_data=json_data,
@@ -410,7 +416,8 @@ def compile_project(
         graph_fields=graph_fields,
         chain_fields=chain_fields,
         code_fields=code_fields,
-        value_maps=value_maps
+        value_maps=value_maps,
+        source_fields=source_fields
     )
 
     return payload
@@ -422,7 +429,8 @@ def _build_graph_payload(
     graph_fields: List[str],
     chain_fields: List[ChainFieldSpec],
     code_fields: List[CodeFieldSpec],
-    value_maps: Dict[str, List[Dict[str, Any]]]
+    value_maps: Dict[str, List[Dict[str, Any]]],
+    source_fields: List[str]
 ) -> GraphPayload:
     """Transforms compiled JSON data into structured payload for Neo4j."""
     project_name = json_data.get("project", {}).get("name", "synesis")
@@ -448,7 +456,7 @@ def _build_graph_payload(
 
     concepts = _extract_concepts(ontology, scalar_fields, graph_fields, value_maps)
     sources, items, mentions, chains, from_source = _extract_corpus_data(
-        corpus, bibliography, relation_definitions, code_field_names
+        corpus, bibliography, relation_definitions, code_field_names, source_fields
     )
 
     return GraphPayload(
@@ -458,6 +466,7 @@ def _build_graph_payload(
         graph_fields=graph_fields,
         chain_fields=chain_fields,
         code_fields=code_fields,
+        source_fields=source_fields,
         value_maps=value_maps,
         concepts=concepts,
         sources=sources,
@@ -522,7 +531,8 @@ def _extract_corpus_data(
     corpus: List[Dict[str, Any]],
     bibliography: Dict[str, Any],
     relation_definitions: Dict[str, str],
-    code_field_names: List[str]
+    code_field_names: List[str],
+    source_fields: List[str]
 ) -> tuple[
     List[Dict[str, Any]],  # sources
     List[Dict[str, Any]],  # items
@@ -550,7 +560,7 @@ def _extract_corpus_data(
 
         # Extract source (SOURCE...END SOURCE block)
         if source_ref not in seen_refs:
-            source_props = _build_source_props(source_ref, corpus_item, bibliography)
+            source_props = _build_source_props(source_ref, corpus_item, bibliography, source_fields)
             sources.append(source_props)
             seen_refs.add(source_ref)
 
@@ -635,23 +645,27 @@ def _extract_corpus_data(
 def _build_source_props(
     source_ref: str,
     item: Dict[str, Any],
-    bibliography: Dict[str, Any]
+    bibliography: Dict[str, Any],
+    source_fields: List[str]
 ) -> Dict[str, Any]:
     """Builds properties of a Source node (SOURCE...END SOURCE block)."""
     bib_entry = bibliography.get(source_ref, {})
     source_meta = item.get("source_metadata", {})
 
-    return {
-        "bibtex": source_ref,
-        "title": source_meta.get("title") or bib_entry.get("title"),
-        "author": source_meta.get("author") or bib_entry.get("author"),
-        "year": source_meta.get("year") or bib_entry.get("year"),
-        "doi": source_meta.get("doi") or bib_entry.get("doi"),
-        "journal": source_meta.get("journal") or bib_entry.get("journal"),
-        "abstract": source_meta.get("abstract") or bib_entry.get("abstract"),
-        "method": source_meta.get("method"),
-        "epistemic_model": source_meta.get("epistemic_model")
-    }
+    props: Dict[str, Any] = {"bibtex": source_ref}
+
+    # Standard bibliographic fields (from bibliography entry)
+    for key in ("title", "author", "year", "doi", "journal", "abstract"):
+        val = source_meta.get(key) or bib_entry.get(key)
+        if val is not None:
+            props[key] = val
+
+    # Dynamic fields from template (SCOPE SOURCE)
+    for field_name in source_fields:
+        if field_name in source_meta and source_meta[field_name] is not None:
+            props[field_name] = source_meta[field_name]
+
+    return props
 
 
 # ============================================================================

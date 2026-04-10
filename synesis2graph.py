@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
 """
-synesis2neo4j.py - Universal Pipeline Synesis → Neo4j (Memory to Graph)
+synesis2graph.py - Universal Pipeline Synesis → Graph Databases
 
-Version: 0.1.0
+Version: 0.2.0
 Repository: https://github.com/synesis-lang/synesis2neo4j
 
 Purpose:
-    Connects the Synesis compiler directly to Neo4j without intermediate files.
+    Connects the Synesis compiler directly to graph databases without intermediate files.
     Compiles the project in memory via `synesis.load()` and synchronizes atomically.
 
 Main components:
     - compile_project: Compiles Synesis project and prepares payload for graph
     - sync_to_neo4j: Persists payload to Neo4j via single transaction
+    - sync_to_graphqlite: Persists payload to GraphQLite (SQLite + Cypher)
     - compute_metrics: Calculates native and GDS metrics automatically
     - TaskReporter: User interface with Rich (fallback to logging)
 
 Critical dependencies:
     - synesis: bibliometric project compiler
-    - neo4j: official graph database driver
+    - neo4j/graphqlite: graph database drivers
     - tomli/tomllib: TOML configuration parser
 
 Optional dependencies:
     - Neo4j GDS: plugin for advanced metrics (PageRank, Betweenness, Louvain)
 
 Usage example:
-    python synesis2neo4j.py --project ./my_project.synp --config config.toml
-    python synesis2neo4j.py --version
+    python synesis2graph.py --project ./my_project.synp --config config.toml
+    python synesis2graph.py --version
 
 Implementation notes:
     - Zero intermediate I/O (everything in memory)
     - Atomicity via single transaction
     - Dynamic labels sanitized against Cypher injection
-    - Uses Result types for errors (CompilationError, ConnectionError, SyncError)
+    - Uses Result types for errors (CompilationError, ConnectionError, SyncError, DependencyError)
     - Metrics calculated automatically (native always, GDS if available)
 """
 from __future__ import annotations
@@ -43,6 +44,7 @@ import re
 import sys
 import tempfile
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -50,8 +52,13 @@ from typing import Any, Dict, List, Optional, Union
 # ============================================================================
 # VERSION
 # ============================================================================
-__version__ = "0.1.2"
-__version_info__ = (0, 1, 2)
+__version__ = "0.2.0"
+__version_info__ = (0, 2, 0)
+
+# Phase 1: backend selection contract (Neo4j active, GraphQLite planned)
+BACKEND_NEO4J = "neo4j"
+BACKEND_GRAPHQLITE = "graphqlite"
+SUPPORTED_BACKENDS = (BACKEND_NEO4J, BACKEND_GRAPHQLITE)
 
 # ============================================================================
 # EXTERNAL IMPORTS
@@ -69,11 +76,6 @@ except ModuleNotFoundError:
     import tomli as tomllib  # type: ignore
 
 try:
-    from neo4j import GraphDatabase
-except ImportError:
-    GraphDatabase = None  # type: ignore
-
-try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
@@ -86,11 +88,29 @@ except ImportError:
 # ============================================================================
 # LOGGING
 # ============================================================================
-logger = logging.getLogger("synesis2neo4j")
+logger = logging.getLogger("synesis2graph")
 _handler = logging.StreamHandler()
 _handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
 logger.addHandler(_handler)
 logger.setLevel(logging.INFO)
+
+
+def get_neo4j_driver_factory() -> Any:
+    """Loads Neo4j driver factory lazily to isolate backend dependencies."""
+    try:
+        from neo4j import GraphDatabase as neo4j_graph_database
+        return neo4j_graph_database
+    except ImportError:
+        return None
+
+
+def get_graphqlite_connect_factory() -> Any:
+    """Loads GraphQLite connect function lazily to isolate backend dependencies."""
+    try:
+        from graphqlite import connect as graphqlite_connect
+        return graphqlite_connect
+    except ImportError:
+        return None
 
 # ============================================================================
 # RESULT TYPES (Pattern: Result Types)
@@ -111,13 +131,19 @@ class CompilationError(PipelineError):
 
 @dataclass
 class ConnectionError(PipelineError):
-    """Error connecting to Neo4j."""
+    """Error connecting to database backends."""
     pass
 
 
 @dataclass
 class SyncError(PipelineError):
     """Error synchronizing with the database."""
+    pass
+
+
+@dataclass
+class DependencyError(PipelineError):
+    """Error for missing runtime dependencies."""
     pass
 
 
@@ -590,8 +616,8 @@ def _extract_corpus_data(
                 rel = chain.get("relation", "").strip()
                 tgt = chain.get("to", "").strip()
                 if src and tgt:
-                    mentions.append({"item_id": item_id, "concept": src, "order": 1})
-                    mentions.append({"item_id": item_id, "concept": tgt, "order": 2})
+                    mentions.append({"item_id": item_id, "concept": src, "mention_order": 1})
+                    mentions.append({"item_id": item_id, "concept": tgt, "mention_order": 2})
 
                     # Normalize relation type and lookup description
                     rel_type = rel.upper().replace(" ", "_").replace("-", "_")
@@ -639,7 +665,7 @@ def _extract_corpus_data(
                     "description": description
                 })
                 from_source.append({"item_id": item_id, "ref": source_ref})
-                mentions.append({"item_id": item_id, "concept": code, "order": 1})
+                mentions.append({"item_id": item_id, "concept": code, "mention_order": 1})
 
     return sources, items, mentions, chains, from_source
 
@@ -729,6 +755,74 @@ def sync_to_neo4j(session: Any, payload: GraphPayload) -> Optional[SyncError]:
         )
 
 
+class _GraphQLiteQueryRunner:
+    """Adapts GraphQLite connection to the run(query, **params) interface."""
+
+    def __init__(self, conn: Any):
+        self.conn = conn
+
+    def run(self, query: str, **params: Any) -> Any:
+        if params:
+            return self.conn.cypher(query, params)
+        return self.conn.cypher(query)
+
+
+def sync_to_graphqlite(conn: Any, payload: GraphPayload) -> Optional[SyncError]:
+    """
+    Synchronizes payload with GraphQLite.
+
+    GraphQLite does not support Neo4j schema commands used in sync_to_neo4j
+    (constraints/index management), so synchronization writes directly using
+    Cypher MERGE/MATCH statements.
+    """
+    tx_started = False
+    runner = _GraphQLiteQueryRunner(conn)
+
+    try:
+        if hasattr(conn, "execute"):
+            try:
+                conn.execute("BEGIN")
+                tx_started = True
+            except Exception:
+                tx_started = False
+
+        steps = [
+            ("sources", lambda: _sync_sources(runner, payload.sources)),
+            ("items", lambda: _sync_items(runner, payload.items)),
+            ("from_source", lambda: _sync_from_source(runner, payload.from_source)),
+            (
+                "concepts",
+                lambda: _sync_concepts(runner, payload.chains, payload.concepts, payload.concept_label),
+            ),
+            (
+                "taxonomies",
+                lambda: _sync_taxonomies(runner, payload.concepts, payload.graph_fields, payload.concept_label),
+            ),
+            ("mentions", lambda: _sync_mentions(runner, payload.mentions, payload.concept_label)),
+        ]
+
+        for step_name, step_fn in steps:
+            try:
+                step_fn()
+            except Exception as step_error:
+                raise RuntimeError(f"GraphQLite sync step '{step_name}' failed: {step_error}") from step_error
+
+        if tx_started and hasattr(conn, "execute"):
+            conn.execute("COMMIT")
+        return None
+    except Exception as e:
+        if tx_started and hasattr(conn, "execute"):
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+        return SyncError(
+            message="Synchronization failed",
+            stage="sync",
+            details=str(e),
+        )
+
+
 def _create_constraints(session: Any, graph_fields: List[str], concept_label: str) -> None:
     """Creates uniqueness constraints in Neo4j schema."""
     # Constraints for dynamic taxonomies
@@ -768,7 +862,7 @@ def _sync_sources(tx: Any, sources: List[Dict[str, Any]]) -> None:
     tx.run("""
         UNWIND $rows AS row
         MERGE (s:Source {bibtex: row.bibtex})
-        SET s += row, s.last_updated = timestamp()
+        SET s = row, s.last_updated = timestamp()
     """, rows=sources)
 
 
@@ -778,7 +872,7 @@ def _sync_items(tx: Any, items: List[Dict[str, Any]]) -> None:
     tx.run("""
         UNWIND $rows AS row
         MERGE (i:Item {item_id: row.item_id})
-        SET i += row, i.last_updated = timestamp()
+        SET i = row, i.last_updated = timestamp()
     """, rows=items)
 
 
@@ -836,43 +930,93 @@ def _sync_taxonomies(
         if not validate_cypher_label(label) or not validate_cypher_label(rel_type):
             continue
 
+        relation_rows: List[Dict[str, Any]] = []
+        for row in concepts:
+            props = row.get("props", {})
+            relations = row.get("relations", {})
+            if not isinstance(props, dict) or not isinstance(relations, dict):
+                continue
+
+            concept_name = props.get("name")
+            raw_vals = relations.get(field_name)
+            if concept_name is None or raw_vals is None:
+                continue
+
+            vals = raw_vals if isinstance(raw_vals, list) else [raw_vals]
+            vals = [v for v in vals if v is not None]
+            if not vals:
+                continue
+
+            relation_rows.append({"concept": concept_name, "vals": vals})
+
+        if not relation_rows:
+            continue
+
         query = f"""
             UNWIND $rows AS row
-            WITH row
-            WHERE row.relations['{field_name}'] IS NOT NULL
-            MATCH (c:{concept_label} {{name: row.props.name}})
-            UNWIND row.relations['{field_name}'] AS val
+            MATCH (c:{concept_label} {{name: row.concept}})
+            UNWIND row.vals AS val
             MERGE (t:{label} {{name: val}})
             MERGE (c)-[:{rel_type}]->(t)
         """
-        tx.run(query, rows=concepts)
+        tx.run(query, rows=relation_rows)
 
     # Second: create mapping relations between taxonomies
     # Topic -> Aspect (MAPPED_TO_ASPECT)
     if "topic" in graph_fields and "aspect" in graph_fields:
-        tx.run("""
-            UNWIND $rows AS row
-            WITH row
-            WHERE row.relations['topic'] IS NOT NULL AND row.relations['aspect'] IS NOT NULL
-            UNWIND row.relations['topic'] AS topic_val
-            UNWIND row.relations['aspect'] AS aspect_val
-            MATCH (topic:Topic {name: topic_val})
-            MATCH (aspect:Aspect {name: aspect_val})
-            MERGE (topic)-[:MAPPED_TO_ASPECT]->(aspect)
-        """, rows=concepts)
+        mapping_rows: List[Dict[str, Any]] = []
+        for row in concepts:
+            relations = row.get("relations", {})
+            if not isinstance(relations, dict):
+                continue
+            topics_raw = relations.get("topic")
+            aspects_raw = relations.get("aspect")
+            if topics_raw is None or aspects_raw is None:
+                continue
+            topics = topics_raw if isinstance(topics_raw, list) else [topics_raw]
+            aspects = aspects_raw if isinstance(aspects_raw, list) else [aspects_raw]
+            topics = [t for t in topics if t is not None]
+            aspects = [a for a in aspects if a is not None]
+            if topics and aspects:
+                mapping_rows.append({"topics": topics, "aspects": aspects})
+
+        if mapping_rows:
+            tx.run("""
+                UNWIND $rows AS row
+                UNWIND row.topics AS topic_val
+                UNWIND row.aspects AS aspect_val
+                MATCH (topic:Topic {name: topic_val})
+                MATCH (aspect:Aspect {name: aspect_val})
+                MERGE (topic)-[:MAPPED_TO_ASPECT]->(aspect)
+            """, rows=mapping_rows)
 
     # Topic -> Dimension (MAPPED_TO_DIMENSION)
     if "topic" in graph_fields and "dimension" in graph_fields:
-        tx.run("""
-            UNWIND $rows AS row
-            WITH row
-            WHERE row.relations['topic'] IS NOT NULL AND row.relations['dimension'] IS NOT NULL
-            UNWIND row.relations['topic'] AS topic_val
-            UNWIND row.relations['dimension'] AS dimension_val
-            MATCH (topic:Topic {name: topic_val})
-            MATCH (dimension:Dimension {name: dimension_val})
-            MERGE (topic)-[:MAPPED_TO_DIMENSION]->(dimension)
-        """, rows=concepts)
+        mapping_rows: List[Dict[str, Any]] = []
+        for row in concepts:
+            relations = row.get("relations", {})
+            if not isinstance(relations, dict):
+                continue
+            topics_raw = relations.get("topic")
+            dimensions_raw = relations.get("dimension")
+            if topics_raw is None or dimensions_raw is None:
+                continue
+            topics = topics_raw if isinstance(topics_raw, list) else [topics_raw]
+            dimensions = dimensions_raw if isinstance(dimensions_raw, list) else [dimensions_raw]
+            topics = [t for t in topics if t is not None]
+            dimensions = [d for d in dimensions if d is not None]
+            if topics and dimensions:
+                mapping_rows.append({"topics": topics, "dimensions": dimensions})
+
+        if mapping_rows:
+            tx.run("""
+                UNWIND $rows AS row
+                UNWIND row.topics AS topic_val
+                UNWIND row.dimensions AS dimension_val
+                MATCH (topic:Topic {name: topic_val})
+                MATCH (dimension:Dimension {name: dimension_val})
+                MERGE (topic)-[:MAPPED_TO_DIMENSION]->(dimension)
+            """, rows=mapping_rows)
 
     # Topic -> Topic (IS_LINKED_TO) - connects topics via RELATES_TO between their concepts
     # strength = number of RELATES_TO relations between concepts of both topics
@@ -894,8 +1038,7 @@ def _sync_mentions(tx: Any, mentions: List[Dict[str, Any]], concept_label: str) 
         UNWIND $rows AS row
         MATCH (i:Item {{item_id: row.item_id}})
         MATCH (c:{concept_label} {{name: row.concept}})
-        MERGE (i)-[m:MENTIONS]->(c)
-        SET m.order = row.order
+        MERGE (i)-[:MENTIONS {{mention_order: row.mention_order}}]->(c)
     """, rows=mentions)
 
 
@@ -912,11 +1055,17 @@ def _sync_concepts(tx: Any, chains: List[Dict[str, Any]], concepts: List[Dict[st
     """
     # First: create concept nodes from ontology
     if concepts:
+        concept_rows: List[Dict[str, Any]] = []
+        for row in concepts:
+            props = row.get("props", {})
+            if isinstance(props, dict) and props.get("name"):
+                concept_rows.append(props)
+
         tx.run(f"""
             UNWIND $rows AS row
-            MERGE (c:{concept_label} {{name: row.props.name}})
-            SET c += row.props
-        """, rows=concepts)
+            MERGE (c:{concept_label} {{name: row.name}})
+            SET c = row
+        """, rows=concept_rows)
 
     # If there are no chains, nothing more to do
     if not chains:
@@ -978,7 +1127,7 @@ def compute_metrics(
     reporter: TaskReporter
 ) -> None:
     """
-    Calculates graph metrics: native (Cypher) and advanced (GDS).
+    Calculates Neo4j graph metrics: native (Cypher) and advanced (GDS).
 
     Native metrics are always calculated.
     GDS metrics are calculated if the plugin is available.
@@ -1010,6 +1159,35 @@ def compute_metrics(
             reporter.warning(f"Error calculating GDS metrics: {e}")
 
 
+def compute_metrics_graphqlite(
+    conn: Any,
+    payload: GraphPayload,
+    reporter: TaskReporter,
+) -> Optional[SyncError]:
+    """
+    Calculates GraphQLite metrics using native Cypher only.
+
+    GraphQLite does not support Neo4j GDS procedures, so this backend keeps
+    the common native metrics to preserve cross-backend comparability.
+    """
+    concept_label = payload.concept_label
+    graph_fields = payload.graph_fields
+    runner = _GraphQLiteQueryRunner(conn)
+
+    with reporter.step("Calculating Native Metrics (GraphQLite)"):
+        try:
+            _compute_native_concept_metrics(runner, concept_label)
+            _compute_native_taxonomy_metrics(runner, concept_label, graph_fields)
+            _compute_native_source_metrics(runner, concept_label)
+        except Exception as e:
+            reporter.warning(f"GraphQLite native metrics skipped due backend limitation: {e}")
+
+    reporter.info(
+        "Advanced metrics skipped for GraphQLite (no Neo4j GDS procedures)."
+    )
+    return None
+
+
 # ----------------------------------------------------------------------------
 # NATIVE METRICS (Pure Cypher - always available)
 # ----------------------------------------------------------------------------
@@ -1030,9 +1208,9 @@ def _compute_native_concept_metrics(session: Any, concept_label: str) -> None:
     # Degree centrality (based on RELATES_TO)
     session.run(f"""
         MATCH (c:{concept_label})
-        OPTIONAL MATCH (c)-[:RELATES_TO]->(out)
-        OPTIONAL MATCH (c)<-[:RELATES_TO]-(in)
-        WITH c, count(DISTINCT out) AS out_deg, count(DISTINCT in) AS in_deg
+        OPTIONAL MATCH (c)-[:RELATES_TO]->(out_node)
+        OPTIONAL MATCH (c)<-[:RELATES_TO]-(in_node)
+        WITH c, count(DISTINCT out_node) AS out_deg, count(DISTINCT in_node) AS in_deg
         SET c.out_degree = out_deg,
             c.in_degree = in_deg,
             c.degree = out_deg + in_deg
@@ -1319,17 +1497,20 @@ class Neo4jConfig:
     database: str = "neo4j"
 
 
-def load_config(config_path: Path) -> Union[Neo4jConfig, ConnectionError]:
-    """Loads Neo4j configuration from TOML file."""
-    if not config_path.exists():
-        return ConnectionError(
-            message="Configuration file not found",
-            stage="config",
-            details=str(config_path)
-        )
+@dataclass
+class GraphQLiteConfig:
+    """GraphQLite (SQLite) connection configuration."""
+    db_path: str
+    extension_path: Optional[str] = None
 
+
+PipelineConfig = Union[Neo4jConfig, GraphQLiteConfig]
+
+
+def _load_neo4j_config(parsed_cfg: Dict[str, Any]) -> Union[Neo4jConfig, ConnectionError]:
+    """Loads and validates Neo4j configuration block."""
     try:
-        cfg = tomllib.loads(config_path.read_text("utf-8"))["neo4j"]
+        cfg = parsed_cfg["neo4j"]
         # Accept both 'uri' and 'URI'
         uri = cfg.get("uri") or cfg.get("URI")
         if not uri:
@@ -1344,14 +1525,98 @@ def load_config(config_path: Path) -> Union[Neo4jConfig, ConnectionError]:
         return ConnectionError(
             message="Incomplete configuration",
             stage="config",
-            details=f"Required field missing: {e}"
+            details=f"Required field missing in [neo4j]: {e}",
         )
+    except Exception as e:
+        return ConnectionError(
+            message="Error reading Neo4j configuration",
+            stage="config",
+            details=str(e),
+        )
+
+
+def _load_graphqlite_config(parsed_cfg: Dict[str, Any]) -> Union[GraphQLiteConfig, ConnectionError]:
+    """Loads and validates GraphQLite configuration block."""
+    try:
+        cfg = parsed_cfg["graphqlite"]
+        db_path = cfg.get("db_path")
+        if not db_path:
+            raise KeyError("'db_path'")
+        extension_path = cfg.get("extension_path")
+        return GraphQLiteConfig(
+            db_path=str(db_path),
+            extension_path=str(extension_path) if extension_path else None,
+        )
+    except KeyError as e:
+        return ConnectionError(
+            message="Incomplete configuration",
+            stage="config",
+            details=f"Required field missing in [graphqlite]: {e}",
+        )
+    except Exception as e:
+        return ConnectionError(
+            message="Error reading GraphQLite configuration",
+            stage="config",
+            details=str(e),
+        )
+
+
+def load_config(config_path: Path, backend: str) -> Union[PipelineConfig, ConnectionError]:
+    """Loads backend-specific configuration from TOML file."""
+    if not config_path.exists():
+        return ConnectionError(
+            message="Configuration file not found",
+            stage="config",
+            details=str(config_path)
+        )
+
+    try:
+        parsed_cfg = tomllib.loads(config_path.read_text("utf-8"))
     except Exception as e:
         return ConnectionError(
             message="Error reading configuration",
             stage="config",
-            details=str(e)
+            details=str(e),
         )
+
+    if backend == BACKEND_NEO4J:
+        return _load_neo4j_config(parsed_cfg)
+    if backend == BACKEND_GRAPHQLITE:
+        return _load_graphqlite_config(parsed_cfg)
+
+    return ConnectionError(
+        message="Unsupported backend in configuration loader",
+        stage="backend",
+        details=f"Supported backends: {', '.join(SUPPORTED_BACKENDS)}",
+    )
+
+
+def validate_backend_config(config: PipelineConfig, backend: str) -> Optional[ConnectionError]:
+    """Validates configuration type against selected backend."""
+    if backend == BACKEND_NEO4J and isinstance(config, Neo4jConfig):
+        return None
+    if backend == BACKEND_GRAPHQLITE and isinstance(config, GraphQLiteConfig):
+        return None
+
+    return ConnectionError(
+        message="Configuration/backend mismatch",
+        stage="config",
+        details=f"Backend '{backend}' does not match loaded configuration type.",
+    )
+
+
+def _resolve_graphqlite_db_path(raw_db_path: str, config_path: Path, project_path: Path) -> Path:
+    """
+    Resolves GraphQLite db path with placeholders and relative path support.
+
+    Supported placeholders:
+    - {project}: project filename stem
+    """
+    resolved = raw_db_path.replace("{project}", project_path.stem)
+    db_path = Path(resolved)
+    if not db_path.is_absolute():
+        db_path = config_path.parent / db_path
+    return db_path.resolve()
 
 
 # ============================================================================
@@ -1402,12 +1667,374 @@ def get_database_name_from_project(json_data: Dict[str, Any]) -> str:
 
 
 # ============================================================================
+# BACKEND ADAPTERS (Phase 3)
+# ============================================================================
+class BackendAdapter(ABC):
+    """Contract for backend-specific persistence and metrics operations."""
+
+    @property
+    @abstractmethod
+    def backend_name(self) -> str:
+        """Human-readable backend name."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def preflight(self, reporter: TaskReporter) -> Optional[PipelineError]:
+        """Runs backend checks that should happen before compilation."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def connect(self, reporter: TaskReporter) -> Optional[PipelineError]:
+        """Opens backend connection resources."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_destination(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        """Prepares destination structures before synchronization."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def clear_destination(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        """Clears existing destination data when required."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def synchronize_payload(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        """Writes payload data to the destination backend."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def compute_backend_metrics(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        """Calculates backend-specific metrics."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def close(self) -> None:
+        """Releases open backend resources."""
+        raise NotImplementedError
+
+
+class Neo4jBackendAdapter(BackendAdapter):
+    """Neo4j backend implementation bound to the BackendAdapter contract."""
+
+    def __init__(self, config: Neo4jConfig):
+        self.config = config
+        self.driver: Any = None
+        self.session: Any = None
+        self.db_name = "neo4j"
+
+    @property
+    def backend_name(self) -> str:
+        return BACKEND_NEO4J
+
+    def preflight(self, reporter: TaskReporter) -> Optional[PipelineError]:
+        return None
+
+    def connect(self, reporter: TaskReporter) -> Optional[PipelineError]:
+        driver_factory = get_neo4j_driver_factory()
+        if driver_factory is None:
+            return DependencyError(
+                message="Neo4j dependency is missing",
+                stage="dependency",
+                details="Install with: pip install neo4j",
+            )
+
+        try:
+            reporter.info(f"[{self.backend_name}] Connecting to {self.config.uri}")
+            self.driver = driver_factory.driver(
+                self.config.uri,
+                auth=(self.config.user, self.config.password),
+            )
+            return None
+        except Exception as e:
+            return ConnectionError(
+                message="Failed to connect to Neo4j",
+                stage="connection",
+                details=str(e),
+            )
+
+    def prepare_destination(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        if self.driver is None:
+            return ConnectionError(
+                message="Neo4j connection not initialized",
+                stage="connection",
+            )
+
+        self.db_name = sanitize_database_name(payload.project_name)
+        reporter.info(f"[{self.backend_name}] Target database: {self.db_name}")
+
+        with reporter.step("Checking/Creating Database"):
+            db_error = ensure_database_exists(self.driver, self.db_name, reporter)
+            if db_error:
+                return db_error
+
+        try:
+            self.session = self.driver.session(database=self.db_name)
+            return None
+        except Exception as e:
+            return ConnectionError(
+                message="Failed to open Neo4j session",
+                stage="connection",
+                details=str(e),
+            )
+
+    def clear_destination(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        # Neo4j clearing is currently performed inside sync_to_neo4j.
+        return None
+
+    def synchronize_payload(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        if self.session is None:
+            return ConnectionError(
+                message="Neo4j session not initialized",
+                stage="connection",
+            )
+
+        with reporter.step("Synchronizing Graph (Transactional)"):
+            sync_error = sync_to_neo4j(self.session, payload)
+            if sync_error:
+                return sync_error
+        return None
+
+    def compute_backend_metrics(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        if self.session is None:
+            return ConnectionError(
+                message="Neo4j session not initialized",
+                stage="connection",
+            )
+        try:
+            compute_metrics(self.session, payload, reporter)
+            return None
+        except Exception as e:
+            return SyncError(
+                message="Metrics calculation failed",
+                stage="metrics",
+                details=str(e),
+            )
+
+    def close(self) -> None:
+        if self.session is not None:
+            self.session.close()
+            self.session = None
+        if self.driver is not None:
+            self.driver.close()
+            self.driver = None
+
+
+class GraphQLiteBackendAdapter(BackendAdapter):
+    """GraphQLite backend implementation."""
+
+    def __init__(self, config: GraphQLiteConfig, config_path: Path, project_path: Path):
+        self.config = config
+        self.config_path = config_path
+        self.project_path = project_path
+        self.db_path: Optional[Path] = None
+        self.conn: Any = None
+
+    @property
+    def backend_name(self) -> str:
+        return BACKEND_GRAPHQLITE
+
+    def preflight(self, reporter: TaskReporter) -> Optional[PipelineError]:
+        self.db_path = _resolve_graphqlite_db_path(
+            raw_db_path=self.config.db_path,
+            config_path=self.config_path,
+            project_path=self.project_path,
+        )
+        reporter.info(f"[{self.backend_name}] Target database: {self.db_path}")
+        return None
+
+    def connect(self, reporter: TaskReporter) -> Optional[PipelineError]:
+        connect_factory = get_graphqlite_connect_factory()
+        if connect_factory is None:
+            return DependencyError(
+                message="GraphQLite dependency is missing",
+                stage="dependency",
+                details="Install with: pip install graphqlite",
+            )
+
+        if self.db_path is None:
+            return ConnectionError(
+                message="GraphQLite database path not resolved",
+                stage="config",
+                details="Call preflight before connect.",
+            )
+
+        if self.db_path.exists() and self.db_path.is_dir():
+            return ConnectionError(
+                message="Invalid GraphQLite database path",
+                stage="config",
+                details=f"Path is a directory: {self.db_path}",
+            )
+
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            # Phase 4 requirement: remove existing db and recreate on each run.
+            if self.db_path.exists():
+                reporter.info(f"[{self.backend_name}] Removing existing database: {self.db_path}")
+                self.db_path.unlink()
+        except Exception as e:
+            return ConnectionError(
+                message="Failed to recreate GraphQLite database file",
+                stage="database_setup",
+                details=str(e),
+            )
+
+        try:
+            reporter.info(f"[{self.backend_name}] Creating database: {self.db_path}")
+            if self.config.extension_path:
+                self.conn = connect_factory(str(self.db_path), extension_path=self.config.extension_path)
+            else:
+                self.conn = connect_factory(str(self.db_path))
+            reporter.info(f"[{self.backend_name}] Connection established")
+            return None
+        except Exception as e:
+            return ConnectionError(
+                message="Failed to connect to GraphQLite",
+                stage="connection",
+                details=str(e),
+            )
+
+    def prepare_destination(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        if self.conn is None:
+            return ConnectionError(
+                message="GraphQLite connection not initialized",
+                stage="connection",
+            )
+        return None
+
+    def clear_destination(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        # Database was recreated during connect, so no additional clear is needed.
+        return None
+
+    def synchronize_payload(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        if self.conn is None:
+            return ConnectionError(
+                message="GraphQLite connection not initialized",
+                stage="connection",
+            )
+
+        with reporter.step("Synchronizing Graph (GraphQLite)"):
+            sync_error = sync_to_graphqlite(self.conn, payload)
+            if sync_error:
+                return sync_error
+        return None
+
+    def compute_backend_metrics(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        if self.conn is None:
+            return ConnectionError(
+                message="GraphQLite connection not initialized",
+                stage="connection",
+            )
+        return compute_metrics_graphqlite(self.conn, payload, reporter)
+
+    def close(self) -> None:
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+
+
+def build_backend_adapter(
+    backend: str,
+    config: PipelineConfig,
+    config_path: Path,
+    project_path: Path,
+) -> Union[BackendAdapter, ConnectionError]:
+    """Creates the backend adapter for the selected backend."""
+    if backend == BACKEND_NEO4J:
+        if not isinstance(config, Neo4jConfig):
+            return ConnectionError(
+                message="Internal configuration type mismatch",
+                stage="config",
+                details="Expected Neo4jConfig for backend 'neo4j'.",
+            )
+        return Neo4jBackendAdapter(config)
+
+    if backend == BACKEND_GRAPHQLITE:
+        if not isinstance(config, GraphQLiteConfig):
+            return ConnectionError(
+                message="Internal configuration type mismatch",
+                stage="config",
+                details="Expected GraphQLiteConfig for backend 'graphqlite'.",
+            )
+        return GraphQLiteBackendAdapter(config, config_path=config_path, project_path=project_path)
+
+    return ConnectionError(
+        message="Unsupported backend",
+        stage="backend",
+        details=f"Supported backends: {', '.join(SUPPORTED_BACKENDS)}",
+    )
+
+
+def execute_backend_pipeline(
+    adapter: BackendAdapter,
+    payload: GraphPayload,
+    reporter: TaskReporter,
+) -> Optional[PipelineError]:
+    """Executes backend pipeline operations using the adapter contract."""
+    operation_error: Optional[PipelineError] = None
+    close_error: Optional[ConnectionError] = None
+
+    try:
+        reporter.info(f"[{adapter.backend_name}] Phase: connect")
+        connect_error = adapter.connect(reporter)
+        if connect_error:
+            operation_error = connect_error
+        else:
+            reporter.info(f"[{adapter.backend_name}] Phase: prepare_destination")
+            prepare_error = adapter.prepare_destination(payload, reporter)
+            if prepare_error:
+                operation_error = prepare_error
+            else:
+                reporter.info(f"[{adapter.backend_name}] Phase: clear_destination")
+                clear_error = adapter.clear_destination(payload, reporter)
+                if clear_error:
+                    operation_error = clear_error
+                else:
+                    reporter.info(f"[{adapter.backend_name}] Phase: synchronize_payload")
+                    sync_error = adapter.synchronize_payload(payload, reporter)
+                    if sync_error:
+                        operation_error = sync_error
+                    else:
+                        reporter.info(f"[{adapter.backend_name}] Phase: compute_metrics")
+                        metrics_error = adapter.compute_backend_metrics(payload, reporter)
+                        if metrics_error:
+                            operation_error = metrics_error
+    except Exception as e:
+        operation_error = SyncError(
+            message="Unhandled backend execution error",
+            stage="sync",
+            details=str(e),
+        )
+    finally:
+        reporter.info(f"[{adapter.backend_name}] Phase: shutdown")
+        try:
+            adapter.close()
+        except Exception as e:
+            close_error = ConnectionError(
+                message="Failed to close backend resources",
+                stage="shutdown",
+                details=str(e),
+            )
+
+        if close_error:
+            if operation_error is None:
+                operation_error = close_error
+            else:
+                reporter.warning(
+                    f"[{adapter.backend_name}] Shutdown warning after prior failure: {close_error.details}"
+                )
+
+    return operation_error
+
+
+# ============================================================================
 # MAIN PIPELINE
 # ============================================================================
 def run_pipeline(
     project_path: Path,
     config_path: Path,
-    reporter: TaskReporter
+    reporter: TaskReporter,
+    backend: str = BACKEND_NEO4J,
 ) -> PipelineResult:
     """
     Executes complete pipeline: compilation → connection → synchronization.
@@ -1421,6 +2048,16 @@ def run_pipeline(
         PipelineResult indicating success or typed error.
     """
     # 1. Input validation
+    if backend not in SUPPORTED_BACKENDS:
+        return PipelineResult(
+            success=False,
+            error=ConnectionError(
+                message="Unsupported backend",
+                stage="backend",
+                details=f"Supported backends: {', '.join(SUPPORTED_BACKENDS)}",
+            ),
+        )
+
     if not project_path.exists():
         return PipelineResult(
             success=False,
@@ -1431,7 +2068,35 @@ def run_pipeline(
             )
         )
 
-    # 2. Compilation
+    # 2. Configuration
+    with reporter.step("Loading Configuration"):
+        config_result = load_config(config_path, backend)
+        if isinstance(config_result, ConnectionError):
+            return PipelineResult(success=False, error=config_result)
+        config = config_result
+
+        config_error = validate_backend_config(config, backend)
+        if config_error:
+            return PipelineResult(success=False, error=config_error)
+
+    adapter_result = build_backend_adapter(
+        backend=backend,
+        config=config,
+        config_path=config_path,
+        project_path=project_path,
+    )
+    if isinstance(adapter_result, ConnectionError):
+        return PipelineResult(
+            success=False,
+            error=adapter_result,
+        )
+    adapter = adapter_result
+
+    preflight_error = adapter.preflight(reporter)
+    if preflight_error:
+        return PipelineResult(success=False, error=preflight_error)
+
+    # 3. Compilation
     with reporter.step("Compiling Project (In-Memory)"):
         compile_result = compile_project(project_path, reporter)
         if isinstance(compile_result, CompilationError):
@@ -1439,53 +2104,12 @@ def run_pipeline(
             return PipelineResult(success=False, error=compile_result)
         payload = compile_result
 
-    # 3. Configuration
-    with reporter.step("Loading Configuration"):
-        config_result = load_config(config_path)
-        if isinstance(config_result, ConnectionError):
-            return PipelineResult(success=False, error=config_result)
-        config = config_result
-
-    # 4. Synchronization
-    if GraphDatabase is None:
+    # 4. Backend synchronization via adapter contract
+    backend_error = execute_backend_pipeline(adapter, payload, reporter)
+    if backend_error:
         return PipelineResult(
             success=False,
-            error=ConnectionError(
-                message="Neo4j driver not installed",
-                stage="connection",
-                details="pip install neo4j"
-            )
-        )
-
-    # Database name based on project
-    db_name = sanitize_database_name(payload.project_name)
-    reporter.info(f"Target database: {db_name}")
-
-    try:
-        with GraphDatabase.driver(config.uri, auth=(config.user, config.password)) as driver:
-            # 4a. Create database if needed
-            with reporter.step("Checking/Creating Database"):
-                db_error = ensure_database_exists(driver, db_name, reporter)
-                if db_error:
-                    return PipelineResult(success=False, error=db_error)
-
-            # 4b. Synchronize data
-            with driver.session(database=db_name) as session:
-                with reporter.step("Synchronizing Graph (Transactional)"):
-                    sync_error = sync_to_neo4j(session, payload)
-                    if sync_error:
-                        return PipelineResult(success=False, error=sync_error)
-
-                # 4c. Calculate graph metrics
-                compute_metrics(session, payload, reporter)
-    except Exception as e:
-        return PipelineResult(
-            success=False,
-            error=ConnectionError(
-                message="Failed to connect to Neo4j",
-                stage="connection",
-                details=str(e)
-            )
+            error=backend_error,
         )
 
     return PipelineResult(
@@ -1501,29 +2125,37 @@ def run_pipeline(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Synesis Direct Link → Neo4j",
+        description="Synesis Direct Link → Graph Databases",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos:
-  python synesis2neo4j.py --project ./meu_projeto.synp
-  python synesis2neo4j.py --project ./analise.synp --config prod.toml
+  python synesis2graph.py --project ./meu_projeto.synp
+  python synesis2graph.py --project ./analise.synp --config prod.toml
+  python synesis2graph.py --project ./analise.synp --backend neo4j
         """
     )
     parser.add_argument(
         "--version", "-v",
         action="version",
-        version=f"synesis2neo4j {__version__}"
+        version=f"synesis2graph {__version__}"
     )
     parser.add_argument("--project", required=True, help="Caminho para o arquivo .synp")
-    parser.add_argument("--config", default="config.toml", help="Configurações do Neo4j")
+    parser.add_argument("--config", default="config.toml", help="Configurações de conexão")
+    parser.add_argument(
+        "--backend",
+        choices=SUPPORTED_BACKENDS,
+        default=BACKEND_NEO4J,
+        help="Backend de destino (neo4j ou graphqlite).",
+    )
     args = parser.parse_args()
 
-    reporter = TaskReporter("Synesis Direct Link")
+    reporter = TaskReporter(f"Synesis Direct Link ({args.backend})")
 
     result = run_pipeline(
         project_path=Path(args.project).resolve(),
         config_path=Path(args.config).resolve(),
-        reporter=reporter
+        reporter=reporter,
+        backend=args.backend,
     )
 
     if result.success:

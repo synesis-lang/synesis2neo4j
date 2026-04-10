@@ -497,7 +497,7 @@ def _extract_concepts(
     concepts = []
 
     for name, entry in ontology.items():
-        # v3.0: campos aplanados na raiz (sem sub-dict "fields")
+        fields = entry.get("fields", {})
         props: Dict[str, Any] = {
             "name": name,
             "description": entry.get("description"),
@@ -505,13 +505,13 @@ def _extract_concepts(
         }
 
         for sf in scalar_fields:
-            if sf in entry:
-                props[sf] = entry[sf]
+            if sf in fields:
+                props[sf] = fields[sf]
 
         relations: Dict[str, List[str]] = {}
         for gf in graph_fields:
-            if gf in entry:
-                raw_val = entry[gf]
+            if gf in fields:
+                raw_val = fields[gf]
                 # Convert value to label if mapping exists
                 if gf in value_maps:
                     if isinstance(raw_val, list):
@@ -585,11 +585,9 @@ def _extract_corpus_data(
                 })
                 from_source.append({"item_id": item_id, "ref": source_ref})
 
-                # v3.0: chains como {from, relation, to}
-                src = chain.get("from", "").strip()
-                rel = chain.get("relation", "").strip()
-                tgt = chain.get("to", "").strip()
-                if src and tgt:
+                nodes = chain.get("nodes", [])
+                if len(nodes) >= 3:
+                    src, rel, tgt = (n.strip() for n in nodes[:3])
                     mentions.append({"item_id": item_id, "concept": src, "order": 1})
                     mentions.append({"item_id": item_id, "concept": tgt, "order": 2})
 
@@ -650,25 +648,22 @@ def _build_source_props(
     bibliography: Dict[str, Any],
     source_fields: List[str]
 ) -> Dict[str, Any]:
-    """Builds properties of a Source node (SOURCE...END SOURCE block).
-
-    v3.0: source_metadata foi removido do corpus. Todos os campos de fonte
-    (bibliograficos e sintetizados) estao em bibliography[source_ref].
-    """
+    """Builds properties of a Source node (SOURCE...END SOURCE block)."""
     bib_entry = bibliography.get(source_ref, {})
+    source_meta = item.get("source_metadata", {})
 
     props: Dict[str, Any] = {"bibtex": source_ref}
 
-    # Standard bibliographic fields
+    # Standard bibliographic fields (from bibliography entry)
     for key in ("title", "author", "year", "doi", "journal", "abstract"):
-        val = bib_entry.get(key)
+        val = source_meta.get(key) or bib_entry.get(key)
         if val is not None:
             props[key] = val
 
-    # Dynamic fields from template (SCOPE SOURCE) - agora em bibliography
+    # Dynamic fields from template (SCOPE SOURCE)
     for field_name in source_fields:
-        if field_name in bib_entry and bib_entry[field_name] is not None:
-            props[field_name] = bib_entry[field_name]
+        if field_name in source_meta and source_meta[field_name] is not None:
+            props[field_name] = source_meta[field_name]
 
     return props
 

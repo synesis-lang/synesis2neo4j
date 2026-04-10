@@ -1,10 +1,11 @@
 # =============================================================================
-# Synesis2Neo4j Configuration
+# Synesis2Graph Configuration
 # =============================================================================
-# This file configures the Neo4j connection for the synesis2neo4j.py pipeline.
+# This file configures backend connections for the synesis2graph.py pipeline.
 #
 # Usage:
-#   python synesis2neo4j.py --project ./project.synp --config config.toml
+#   python synesis2graph.py --project ./project.synp --backend neo4j --config config.toml
+#   python synesis2graph.py --project ./project.synp --backend graphqlite --config config.toml
 #
 # Documentation: https://synesis-lang.github.io/synesis-docs
 # =============================================================================
@@ -19,5 +20,15 @@
 
 uri = "bolt://127.0.0.1:7687"
 user = "neo4j"
-password = "YOUR_PASSWORD_HERE"
-# database = "YOUR_DATABASE_NAME_HERE"  # Optional: overrides project-based naming
+password = "CH240120ch!"
+database = "factors"  # Optional: overrides project-based naming
+
+[graphqlite]
+# GraphQLite (SQLite) connection settings
+#
+# db_path: Target SQLite database file. Supports placeholder {project}
+#          where {project} is replaced by the .synp filename stem.
+# extension_path: Optional path to a custom GraphQLite extension binary.
+
+db_path = "./graphs/{project}.db"
+# extension_path = "C:/path/to/graphqlite_extension"

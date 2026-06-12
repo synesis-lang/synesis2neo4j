@@ -11,13 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.3.0] - 2026-06-11
+## [0.2.0] - 2026-06-12
 
 ### Added
 
-- **Installable package structure** (`synesis-graph/`, `pyproject.toml`)
+- **Installable package structure** (`synesis_graph/`, `pyproject.toml`)
   - New `pyproject.toml` defines the `synesis-graph` package with `click>=8.0` and `synesis>=0.5.0` as core dependencies; `neo4j>=5.0` and `graphqlite` as optional extras (`pip install synesis-graph[neo4j]`).
-  - `synesis-graph/__init__.py` re-exports the public API from `synesis2graph.py` (`run_pipeline`, `compile_project`, `load_json_project`, `GraphPayload`, `PipelineResult`, backend constants).
+  - `synesis_graph/__init__.py` re-exports the public API from `synesis2graph.py` (`run_pipeline`, `compile_project`, `load_json_project`, `GraphPayload`, `PipelineResult`, backend constants).
 
 - **Click-based CLI in `synesis2graph.py`** — replaced the `argparse` `main()` directly in the script:
   - Entry point `synesis-graph` registered via `pyproject.toml` (i.e. `pip install -e .` → `synesis-graph` in PATH).
@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `--project` and `--json` are shared source options on every subcommand (mutually exclusive, one required); `--config` defaults to `config.toml`.
   - HTML-specific flags (`--output`, `--group-by`, `--min-frequency`, `--min-source-count`, `--max-nodes`, `--max-hyperedges`, `--include-isolated`, `--all`) moved from a flat arg group to the `html` subcommand.
   - Graceful fallback to `argparse` when `click` is not installed (`python synesis2graph.py --backend ...` still works).
+
+### Changed
+
+- Repository and package renamed from `synesis2neo4j` to `synesis-graph`.
 
 ---
 
@@ -109,12 +113,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Roadmap
 
-### [0.2.0] - Planned
+### [0.3.0] - Planned
 - [ ] Custom Synesis-specific MCP server
 - [ ] Optimized prompts for qualitative research
 - [ ] Interactive configuration interface
 
-### [0.3.0] - Future
+### [0.4.0] - Future
 - [ ] Web interface for graph visualization
 - [ ] Export to external formats (GraphML, GEXF)
 - [ ] Jupyter Notebooks integration

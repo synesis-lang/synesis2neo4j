@@ -2,3 +2,15 @@
 tests/
 .gitnexus
 .claude
+
+# Generated HTML outputs
+*.html
+graphs/
+
+# Config with credentials
+config.toml
+
+# Build artifacts
+*.egg-info/
+__pycache__/
+*.pyc

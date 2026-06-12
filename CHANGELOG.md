@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] - 2026-06-11
+
+### Added
+
+- **Installable package structure** (`synesis-graph/`, `pyproject.toml`)
+  - New `pyproject.toml` defines the `synesis-graph` package with `click>=8.0` and `synesis>=0.5.0` as core dependencies; `neo4j>=5.0` and `graphqlite` as optional extras (`pip install synesis-graph[neo4j]`).
+  - `synesis-graph/__init__.py` re-exports the public API from `synesis2graph.py` (`run_pipeline`, `compile_project`, `load_json_project`, `GraphPayload`, `PipelineResult`, backend constants).
+
+- **Click-based CLI in `synesis2graph.py`** — replaced the `argparse` `main()` directly in the script:
+  - Entry point `synesis-graph` registered via `pyproject.toml` (i.e. `pip install -e .` → `synesis-graph` in PATH).
+  - Same `_SynesisGroup` / `_SynesisCommand` / `_ex()` pattern used in `synesis` and `synesis-coder`: Unix-style output, ANSI colors (suppressed when stdout is not a TTY), `sys.stdout.buffer.write(UTF-8)` for encoding safety on Windows.
+  - Three subcommands replacing the flat `--backend` flag: `neo4j`, `graphqlite`, `html` — each with their own `--help` and colored `Examples:` epilog.
+  - `--project` and `--json` are shared source options on every subcommand (mutually exclusive, one required); `--config` defaults to `config.toml`.
+  - HTML-specific flags (`--output`, `--group-by`, `--min-frequency`, `--min-source-count`, `--max-nodes`, `--max-hyperedges`, `--include-isolated`, `--all`) moved from a flat arg group to the `html` subcommand.
+  - Graceful fallback to `argparse` when `click` is not installed (`python synesis2graph.py --backend ...` still works).
+
+---
+
 ## [0.1.2] - 2025-02-01
 
 ### Added
@@ -105,6 +123,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Links
 
-- **Repository:** [github.com/synesis-lang/synesis2neo4j](https://github.com/synesis-lang/synesis2neo4j)
+- **Repository:** [github.com/synesis-lang/synesis-graph](https://github.com/synesis-lang/synesis-graph)
 - **Documentation:** [synesis-lang.github.io/synesis-docs](https://synesis-lang.github.io/synesis-docs)
-- **Issues:** [GitHub Issues](https://github.com/synesis-lang/synesis2neo4j/issues)
+- **Issues:** [GitHub Issues](https://github.com/synesis-lang/synesis-graph/issues)

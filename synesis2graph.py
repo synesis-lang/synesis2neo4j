@@ -2,7 +2,7 @@
 """
 synesis2graph.py - Universal Pipeline Synesis → Graph Databases
 
-Version: 0.2.0
+Version: 0.3.0
 Repository: https://github.com/synesis-lang/synesis2neo4j
 
 Purpose:
@@ -25,8 +25,9 @@ Optional dependencies:
     - Neo4j GDS: plugin for advanced metrics (PageRank, Betweenness, Louvain)
 
 Usage example:
-    python synesis2graph.py --project ./my_project.synp --config config.toml
-    python synesis2graph.py --version
+    synesis-graph neo4j --project ./my_project.synp
+    synesis-graph html --project ./my_project.synp --output graph.html --all
+    synesis-graph --version
 
 Implementation notes:
     - Zero intermediate I/O (everything in memory)
@@ -37,7 +38,6 @@ Implementation notes:
 """
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import re
@@ -49,16 +49,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+try:
+    import click
+    _CLICK_AVAILABLE = True
+except ImportError:
+    _CLICK_AVAILABLE = False
+
 # ============================================================================
 # VERSION
 # ============================================================================
-__version__ = "0.2.0"
-__version_info__ = (0, 2, 0)
+__version__ = "0.3.0"
+__version_info__ = (0, 3, 0)
 
 # Phase 1: backend selection contract (Neo4j active, GraphQLite planned)
 BACKEND_NEO4J = "neo4j"
 BACKEND_GRAPHQLITE = "graphqlite"
-SUPPORTED_BACKENDS = (BACKEND_NEO4J, BACKEND_GRAPHQLITE)
+BACKEND_HTML = "html"
+SUPPORTED_BACKENDS = (BACKEND_NEO4J, BACKEND_GRAPHQLITE, BACKEND_HTML)
 
 # ============================================================================
 # EXTERNAL IMPORTS
@@ -332,17 +339,19 @@ class _StepContext:
 # ============================================================================
 # TEMPLATE ANALYSIS
 # ============================================================================
-def analyze_template(template_data: Dict[str, Any]) -> tuple[List[str], List[str], List[ChainFieldSpec], List[CodeFieldSpec], Dict[str, List[Dict]], List[str]]:
+def analyze_template(template_data: Dict[str, Any]) -> tuple[List[str], List[str], List[ChainFieldSpec], List[CodeFieldSpec], Dict[str, List[Dict]], List[str], str]:
     """
     Analyzes Synesis template to identify scalar, relational, CHAIN, CODE and SOURCE fields.
 
     Returns:
-        Tuple (scalar_fields, graph_fields, chain_fields, code_fields, value_maps, source_fields).
+        Tuple (scalar_fields, graph_fields, chain_fields, code_fields, value_maps,
+               source_fields, memo_field_name).
         - graph_fields become taxonomy nodes
         - chain_fields define nodes with self-referential relations (triples)
         - code_fields define references to concepts (list of codes)
         - value_maps maps numeric indices to labels (for ORDERED/ENUMERATED)
         - source_fields become dynamic properties on Source nodes
+        - memo_field_name is the ITEM-scoped MEMO field name (e.g. "note", "resumo")
     """
     field_specs = template_data.get("field_specs", {})
 
@@ -352,6 +361,7 @@ def analyze_template(template_data: Dict[str, Any]) -> tuple[List[str], List[str
     code_fields: List[CodeFieldSpec] = []
     value_maps: Dict[str, List[Dict]] = {}
     source_fields: List[str] = []
+    memo_field_name: str = "note"  # default for backwards compatibility
 
     # Iterate through all fields and filter by scope
     for field_name, spec in field_specs.items():
@@ -379,11 +389,13 @@ def analyze_template(template_data: Dict[str, Any]) -> tuple[List[str], List[str
                     field_name=field_name,
                     description=spec.get("description", "")
                 ))
+            elif field_type == "MEMO":
+                memo_field_name = field_name
 
         elif scope == "SOURCE":
             source_fields.append(field_name)
 
-    return scalar_fields, graph_fields, chain_fields, code_fields, value_maps, source_fields
+    return scalar_fields, graph_fields, chain_fields, code_fields, value_maps, source_fields, memo_field_name
 
 
 def get_taxonomy_labels(graph_fields: List[str]) -> List[str]:
@@ -394,6 +406,56 @@ def get_taxonomy_labels(graph_fields: List[str]) -> List[str]:
 # ============================================================================
 # COMPILATION AND PREPARATION
 # ============================================================================
+def load_json_project(
+    json_path: Path,
+    reporter: TaskReporter
+) -> Union[GraphPayload, CompilationError]:
+    """
+    Loads a pre-compiled Synesis JSON export (v3.0) and builds a GraphPayload.
+
+    Args:
+        json_path: Path to the exported .json file
+        reporter: Reporter for visual feedback
+
+    Returns:
+        GraphPayload on success, CompilationError on failure.
+    """
+    reporter.info(f"Loading Synesis JSON export: {json_path}")
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            json_data = json.load(f)
+    except Exception as e:
+        return CompilationError(
+            message="Failed to read JSON export",
+            stage="load",
+            diagnostics=[str(e)],
+        )
+
+    version = json_data.get("version", "")
+    if not str(version).startswith("3"):
+        reporter.warning(f"JSON version '{version}' may not be fully supported (expected 3.x)")
+
+    corpus_count = len(json_data.get("corpus", []))
+    reporter.success(f"JSON loaded. {corpus_count} corpus items.")
+
+    scalar_fields, graph_fields, chain_fields, code_fields, value_maps, source_fields, memo_field_name = analyze_template(
+        json_data["template"]
+    )
+
+    payload = _build_graph_payload(
+        json_data=json_data,
+        scalar_fields=scalar_fields,
+        graph_fields=graph_fields,
+        chain_fields=chain_fields,
+        code_fields=code_fields,
+        value_maps=value_maps,
+        source_fields=source_fields,
+        memo_field_name=memo_field_name,
+    )
+
+    return payload
+
+
 def compile_project(
     project_path: Path,
     reporter: TaskReporter
@@ -434,7 +496,7 @@ def compile_project(
     corpus_count = len(json_data.get("corpus", []))
     reporter.success(f"Compilation OK. {corpus_count} items processed.")
 
-    scalar_fields, graph_fields, chain_fields, code_fields, value_maps, source_fields = analyze_template(json_data["template"])
+    scalar_fields, graph_fields, chain_fields, code_fields, value_maps, source_fields, memo_field_name = analyze_template(json_data["template"])
 
     payload = _build_graph_payload(
         json_data=json_data,
@@ -443,7 +505,8 @@ def compile_project(
         chain_fields=chain_fields,
         code_fields=code_fields,
         value_maps=value_maps,
-        source_fields=source_fields
+        source_fields=source_fields,
+        memo_field_name=memo_field_name,
     )
 
     return payload
@@ -456,7 +519,8 @@ def _build_graph_payload(
     chain_fields: List[ChainFieldSpec],
     code_fields: List[CodeFieldSpec],
     value_maps: Dict[str, List[Dict[str, Any]]],
-    source_fields: List[str]
+    source_fields: List[str],
+    memo_field_name: str = "note",
 ) -> GraphPayload:
     """Transforms compiled JSON data into structured payload for Neo4j."""
     project_name = json_data.get("project", {}).get("name", "synesis")
@@ -482,7 +546,7 @@ def _build_graph_payload(
 
     concepts = _extract_concepts(ontology, scalar_fields, graph_fields, value_maps)
     sources, items, mentions, chains, from_source = _extract_corpus_data(
-        corpus, bibliography, relation_definitions, code_field_names, source_fields
+        corpus, bibliography, relation_definitions, code_field_names, source_fields, memo_field_name
     )
 
     return GraphPayload(
@@ -558,7 +622,8 @@ def _extract_corpus_data(
     bibliography: Dict[str, Any],
     relation_definitions: Dict[str, str],
     code_field_names: List[str],
-    source_fields: List[str]
+    source_fields: List[str],
+    memo_field_name: str = "note",
 ) -> tuple[
     List[Dict[str, Any]],  # sources
     List[Dict[str, Any]],  # items
@@ -570,8 +635,14 @@ def _extract_corpus_data(
     Extracts sources, items and relationships from corpus.
 
     Supports two template patterns:
-    - CHAIN: triples (source, relation, target) with note as description
+    - CHAIN: triples (source, relation, target) with per-triple description
     - CODE: list of codes referencing concepts
+
+    The memo_field_name identifies the ITEM-scoped MEMO field (e.g. "note" for
+    bibliometrics, "resumo" for causation coding). When the MEMO is a parallel list
+    (one entry per chain triple), each triple gets its own description. When the MEMO
+    is a single string shared across all triples of a chained sequence, that string is
+    used as the description for every triple in the item.
     """
     sources: List[Dict[str, Any]] = []
     items: List[Dict[str, Any]] = []
@@ -597,17 +668,24 @@ def _extract_corpus_data(
         has_code = any(cf in data and data[cf] for cf in code_field_names)
 
         if has_chain:
-            # CHAIN pattern (bibliometrics): note/chain bundles
-            notes = data.get("note", [])
             chain_list = data.get("chain", [])
+            raw_memo = data.get(memo_field_name, [])
+            # Parallel list: one note per triple (bibliometrics format).
+            # Single string or absent: shared description across all triples (causation format).
+            notes: List[str] = raw_memo if isinstance(raw_memo, list) else []
+            shared_note: str = raw_memo if isinstance(raw_memo, str) else ""
+            base_text: str = (
+                data.get("text") or data.get("citação") or data.get("citation") or ""
+            )
 
-            for idx, (note, chain) in enumerate(zip(notes, chain_list), 1):
+            for idx, chain in enumerate(chain_list, 1):
+                note = notes[idx - 1] if idx - 1 < len(notes) else shared_note
                 item_id = f"{corpus_id}_n{idx:04d}"
 
                 items.append({
                     "item_id": item_id,
-                    "citation": data.get("text", ""),
-                    "description": note
+                    "citation": base_text,
+                    "description": note,
                 })
                 from_source.append({"item_id": item_id, "ref": source_ref})
 
@@ -628,7 +706,7 @@ def _extract_corpus_data(
                         "target": tgt,
                         "type": rel_type,
                         "description": rel_description,
-                        "item_id": item_id
+                        "item_id": item_id,
                     })
 
         elif has_code:
@@ -1504,7 +1582,19 @@ class GraphQLiteConfig:
     extension_path: Optional[str] = None
 
 
-PipelineConfig = Union[Neo4jConfig, GraphQLiteConfig]
+@dataclass
+class HTMLConfig:
+    """HTML graph output configuration."""
+    output_path: str = "./graph.html"
+    group_by: Optional[str] = None
+    min_frequency: int = 3
+    min_source_count: int = 2
+    max_nodes: int = 200
+    max_hyperedges: int = 50
+    include_isolated: bool = False
+
+
+PipelineConfig = Union[Neo4jConfig, GraphQLiteConfig, HTMLConfig]
 
 
 def _load_neo4j_config(parsed_cfg: Dict[str, Any]) -> Union[Neo4jConfig, ConnectionError]:
@@ -1561,8 +1651,31 @@ def _load_graphqlite_config(parsed_cfg: Dict[str, Any]) -> Union[GraphQLiteConfi
         )
 
 
+def _load_html_config(parsed_cfg: Dict[str, Any]) -> HTMLConfig:
+    """Loads HTML configuration block with defaults (all fields optional)."""
+    cfg = parsed_cfg.get("html", {})
+    return HTMLConfig(
+        output_path=str(cfg.get("output_path", "./graph.html")),
+        group_by=cfg.get("group_by") or None,
+        min_frequency=int(cfg.get("min_frequency", 3)),
+        min_source_count=int(cfg.get("min_source_count", 2)),
+        max_nodes=int(cfg.get("max_nodes", 200)),
+        max_hyperedges=int(cfg.get("max_hyperedges", 50)),
+        include_isolated=bool(cfg.get("include_isolated", False)),
+    )
+
+
 def load_config(config_path: Path, backend: str) -> Union[PipelineConfig, ConnectionError]:
     """Loads backend-specific configuration from TOML file."""
+    if backend == BACKEND_HTML:
+        if not config_path.exists():
+            return HTMLConfig()
+        try:
+            parsed_cfg = tomllib.loads(config_path.read_text("utf-8"))
+            return _load_html_config(parsed_cfg)
+        except Exception:
+            return HTMLConfig()
+
     if not config_path.exists():
         return ConnectionError(
             message="Configuration file not found",
@@ -1596,6 +1709,8 @@ def validate_backend_config(config: PipelineConfig, backend: str) -> Optional[Co
     if backend == BACKEND_NEO4J and isinstance(config, Neo4jConfig):
         return None
     if backend == BACKEND_GRAPHQLITE and isinstance(config, GraphQLiteConfig):
+        return None
+    if backend == BACKEND_HTML and isinstance(config, HTMLConfig):
         return None
 
     return ConnectionError(
@@ -1933,6 +2048,576 @@ class GraphQLiteBackendAdapter(BackendAdapter):
             self.conn = None
 
 
+# ============================================================================
+# HTML BACKEND
+# ============================================================================
+_HTML_PALETTE = [
+    "#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F",
+    "#EDC948", "#B07AA1", "#FF9DA7", "#9C755F", "#BAB0AC",
+    "#D37295", "#A0CBE8",
+]
+
+_HTML_RELATION_COLORS: Dict[str, str] = {
+    "ENABLES": "#59A14F",
+    "INFLUENCES": "#4E79A7",
+    "CONSTRAINS": "#F28E2B",
+    "CONTESTED_BY": "#E15759",
+    "RELATES_TO": "#9C755F",
+}
+
+
+def _html_relation_color(relation: str) -> str:
+    norm = relation.upper().replace("-", "_").replace(" ", "_")
+    if norm in _HTML_RELATION_COLORS:
+        return _HTML_RELATION_COLORS[norm]
+    return _HTML_PALETTE[abs(hash(norm)) % len(_HTML_PALETTE)]
+
+
+def _html_slug(name: str) -> str:
+    """Creates a stable, HTML-safe ID from a concept name."""
+    slug = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_')
+    return slug or "node"
+
+
+def _html_apply_filters(
+    payload: GraphPayload,
+    min_frequency: int,
+    min_source_count: int,
+    max_nodes: int,
+    include_isolated: bool,
+) -> tuple[set, List[Dict[str, Any]]]:
+    """
+    Filters concepts by mention frequency and source coverage, then by degree.
+    Returns (kept_concept_names_set, filtered_chains).
+    """
+    item_to_source: Dict[str, str] = {r["item_id"]: r["ref"] for r in payload.from_source}
+
+    freq: Dict[str, int] = {}
+    concept_sources: Dict[str, set] = {}
+    for m in payload.mentions:
+        c = m["concept"]
+        freq[c] = freq.get(c, 0) + 1
+        src = item_to_source.get(m["item_id"])
+        if src:
+            concept_sources.setdefault(c, set()).add(src)
+
+    degree: Dict[str, int] = {}
+    for ch in payload.chains:
+        degree[ch["source"]] = degree.get(ch["source"], 0) + 1
+        degree[ch["target"]] = degree.get(ch["target"], 0) + 1
+
+    all_names = {c["props"]["name"] for c in payload.concepts}
+
+    kept: set = set()
+    for name in all_names:
+        f = freq.get(name, 0)
+        sc = len(concept_sources.get(name, set()))
+        if f >= min_frequency and sc >= min_source_count:
+            kept.add(name)
+
+    if not include_isolated:
+        has_chain = set()
+        for ch in payload.chains:
+            has_chain.add(ch["source"])
+            has_chain.add(ch["target"])
+        kept = {n for n in kept if n in has_chain}
+
+    if max_nodes > 0 and len(kept) > max_nodes:
+        sorted_kept = sorted(kept, key=lambda n: degree.get(n, 0), reverse=True)
+        kept = set(sorted_kept[:max_nodes])
+
+    filtered_chains = [
+        ch for ch in payload.chains
+        if ch["source"] in kept and ch["target"] in kept
+    ]
+
+    return kept, filtered_chains
+
+
+def _html_resolve_grouping(
+    payload: GraphPayload,
+    kept: set,
+    group_by: Optional[str],
+) -> tuple[Dict[str, int], Dict[str, str], List[Dict[str, Any]], str]:
+    """
+    Assigns integer community IDs to concepts by grouping on a graph_field.
+    Returns (cid_map, cname_map, legend_list, field_name).
+    """
+    field_name = group_by
+    if not field_name and payload.graph_fields:
+        for gf in payload.graph_fields:
+            if re.match(r'^topic', gf, re.IGNORECASE):
+                field_name = gf
+                break
+        if not field_name:
+            field_name = payload.graph_fields[0]
+
+    concept_to_group: Dict[str, str] = {}
+    if field_name:
+        for c in payload.concepts:
+            name = c["props"]["name"]
+            if name not in kept:
+                continue
+            vals = c["relations"].get(field_name)
+            if isinstance(vals, list) and vals and vals[0]:
+                concept_to_group[name] = str(vals[0])
+            elif vals and not isinstance(vals, list):
+                concept_to_group[name] = str(vals)
+            else:
+                concept_to_group[name] = "Other"
+    else:
+        for name in kept:
+            concept_to_group[name] = "All"
+
+    group_counts: Dict[str, int] = {}
+    for name in kept:
+        g = concept_to_group.get(name, "Other")
+        group_counts[g] = group_counts.get(g, 0) + 1
+
+    groups_ordered = sorted(group_counts.keys(), key=lambda g: (-group_counts[g], g))
+    group_to_cid = {g: i for i, g in enumerate(groups_ordered)}
+
+    cid_map = {name: group_to_cid[concept_to_group.get(name, "Other")] for name in kept}
+    cname_map = {name: concept_to_group.get(name, "Other") for name in kept}
+
+    legend = [
+        {
+            "cid": group_to_cid[g],
+            "color": _HTML_PALETTE[group_to_cid[g] % len(_HTML_PALETTE)],
+            "label": g,
+            "count": group_counts[g],
+        }
+        for g in groups_ordered
+    ]
+
+    return cid_map, cname_map, legend, (field_name or "All")
+
+
+def _html_build_hyperedges(
+    payload: GraphPayload,
+    kept: set,
+    max_hyperedges: int,
+    slug_map: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Builds hyperedge dicts from corpus entries that link ≥ 3 distinct concepts.
+    Groups chains sharing the same parent corpus entry (same item_id prefix).
+    """
+    _suffix_re = re.compile(r'^(.+)_[nc]\d{4}$')
+
+    item_desc: Dict[str, str] = {
+        item["item_id"]: item.get("description", "") for item in payload.items
+    }
+    item_source: Dict[str, str] = {r["item_id"]: r["ref"] for r in payload.from_source}
+
+    corpus_concepts: Dict[str, set] = {}
+    corpus_first_item: Dict[str, str] = {}
+    for ch in payload.chains:
+        item_id = ch["item_id"]
+        m = _suffix_re.match(item_id)
+        corpus_id = m.group(1) if m else item_id
+        corpus_concepts.setdefault(corpus_id, set())
+        corpus_concepts[corpus_id].add(ch["source"])
+        corpus_concepts[corpus_id].add(ch["target"])
+        if corpus_id not in corpus_first_item:
+            corpus_first_item[corpus_id] = item_id
+
+    candidates = []
+    for corpus_id, concepts_set in corpus_concepts.items():
+        filtered = concepts_set & kept
+        if len(filtered) < 3:
+            continue
+        first_item_id = corpus_first_item.get(corpus_id, "")
+        desc = item_desc.get(first_item_id, "")
+        src = item_source.get(first_item_id, corpus_id)
+        if desc:
+            label = (desc[:57] + "…") if len(desc) > 60 else desc
+        else:
+            label = f"{src} · {corpus_id}"
+        candidates.append({
+            "corpus_id": corpus_id,
+            "concepts": filtered,
+            "label": label,
+            "source_ref": src,
+            "size": len(filtered),
+        })
+
+    candidates.sort(key=lambda c: -c["size"])
+    candidates = candidates[:max(0, max_hyperedges)]
+
+    _sm = slug_map or {}
+    return [
+        {
+            "id": _html_slug(cand["corpus_id"]),
+            "label": cand["label"],
+            "nodes": [_sm.get(c, _html_slug(c)) for c in cand["concepts"]],
+            "relation": "RELATES_TO",
+            "confidence": "EXTRACTED",
+            "source_item": cand["source_ref"],
+        }
+        for cand in candidates
+    ]
+
+
+def _html_render_payload(
+    payload: GraphPayload,
+    config: HTMLConfig,
+    template_path: Path,
+) -> str:
+    """Builds the complete HTML string from a GraphPayload and HTMLConfig."""
+    kept, filtered_chains = _html_apply_filters(
+        payload,
+        min_frequency=config.min_frequency,
+        min_source_count=config.min_source_count,
+        max_nodes=config.max_nodes,
+        include_isolated=config.include_isolated,
+    )
+
+    cid_map, cname_map, legend, legend_title = _html_resolve_grouping(
+        payload, kept, group_by=config.group_by
+    )
+    legend_title_display = legend_title.replace("_", " ").title()
+
+    # Build ALL_GROUPINGS: one entry per graph_field (for sidebar tabs).
+    all_groupings: Dict[str, Any] = {}
+    for gf in payload.graph_fields:
+        _cid_map, _cname_map, _leg, _fname = _html_resolve_grouping(payload, kept, group_by=gf)
+        _title = _fname.replace("_", " ").title()
+        all_groupings[gf] = {
+            "title":          _title,
+            "legend":         _leg,
+            "value_to_cid":   {e["label"]: e["cid"]   for e in _leg},
+            "value_to_color": {e["label"]: e["color"] for e in _leg},
+        }
+
+    degree: Dict[str, int] = {}
+    for ch in filtered_chains:
+        degree[ch["source"]] = degree.get(ch["source"], 0) + 1
+        degree[ch["target"]] = degree.get(ch["target"], 0) + 1
+
+    item_to_source: Dict[str, str] = {r["item_id"]: r["ref"] for r in payload.from_source}
+    concept_first_source: Dict[str, str] = {}
+    for m in payload.mentions:
+        c = m["concept"]
+        if c in kept and c not in concept_first_source:
+            src = item_to_source.get(m["item_id"], "")
+            if src:
+                concept_first_source[c] = src
+
+    concept_index: Dict[str, Dict[str, Any]] = {
+        c["props"]["name"]: c for c in payload.concepts
+    }
+
+    # Build collision-free slug map: two different names must never share an ID.
+    _slug_counts: Dict[str, int] = {}
+    slug_map: Dict[str, str] = {}
+    for name in kept:
+        base = _html_slug(name)
+        count = _slug_counts.get(base, 0)
+        _slug_counts[base] = count + 1
+        slug_map[name] = base if count == 0 else f"{base}_{count + 1}"
+
+    # Build evidence data: concept_slug → [{src, type, text, note?}]
+    # Uses the full payload.chains (not just filtered_chains) so concepts at the
+    # boundary of the filter still show all their evidence records.
+    item_index: Dict[str, Dict[str, Any]] = {
+        item["item_id"]: item for item in payload.items
+    }
+    _ev_seen: Dict[str, set] = {}
+    evidence_by_slug: Dict[str, List[Dict[str, str]]] = {}
+    for ch in payload.chains:
+        iid = ch.get("item_id", "")
+        if not iid:
+            continue
+        item = item_index.get(iid)
+        if not item:
+            continue
+        text = (item.get("citation") or "").strip()
+        note = (item.get("description") or "").strip()
+        if not text and not note:
+            continue
+        ch_type = ch.get("type", "")
+        src_ref = item_to_source.get(iid, iid)
+        for role in (ch["source"], ch["target"]):
+            if role not in kept:
+                continue
+            slug = slug_map[role]
+            dedup_key = (iid, ch_type)
+            if dedup_key in _ev_seen.get(slug, set()):
+                continue
+            _ev_seen.setdefault(slug, set()).add(dedup_key)
+            lst = evidence_by_slug.setdefault(slug, [])
+            if len(lst) >= 60:
+                continue
+            entry: Dict[str, str] = {
+                "src":  src_ref[:60],
+                "type": ch_type,
+                "text": text[:300],
+            }
+            if note:
+                entry["note"] = note[:150]
+            lst.append(entry)
+
+    # Build Evidence-mode graph: individual (ungrouped) chain edges.
+    # Uses full payload.chains (not filtered_chains) so evidence is available even
+    # when both endpoint nodes are hidden by frequency/source filters.
+    ev_chain_edges: List[Dict[str, Any]] = []
+    for ch in payload.chains:
+        src_slug = slug_map.get(ch["source"], _html_slug(ch["source"]))
+        tgt_slug = slug_map.get(ch["target"], _html_slug(ch["target"]))
+        ch_type  = ch.get("type", "")
+        color    = _html_relation_color(ch_type)
+        iid      = ch.get("item_id", "")
+        src_ref  = item_to_source.get(iid, iid)
+        ev_chain_edges.append({
+            "from":      src_slug,
+            "to":        tgt_slug,
+            "label":     "",
+            "title":     f"{ch_type} — {src_ref}",
+            "color":     {"color": color, "opacity": 0.55},
+            "dashes":    False,
+            "width":     0.8,
+            "arrows":    {"to": {"enabled": True, "scaleFactor": 0.4}},
+            "_ev_chain": True,
+            "_type":     ch_type,
+            "_src":      src_ref,
+        })
+
+    # Collect concept names referenced in ev_chain_edges that are absent from kept.
+    # These nodes must exist in the vis dataset for Evidence-mode edges to render.
+    kept_slugs = {slug_map[n] for n in kept}
+    ev_extra_nodes: List[Dict[str, Any]] = []
+    _ev_extra_seen: set = set()
+    for ev_edge in ev_chain_edges:
+        for slug in (ev_edge["from"], ev_edge["to"]):
+            if slug in kept_slugs or slug in _ev_extra_seen:
+                continue
+            _ev_extra_seen.add(slug)
+            # Reconstruct original name from slug (best-effort reverse lookup)
+            name = next((n for n, s in slug_map.items() if s == slug), slug)
+            c_data = concept_index.get(name, {})
+            props = c_data.get("props", {})
+            cid   = cid_map.get(name, 0)
+            color = _HTML_PALETTE[cid % len(_HTML_PALETTE)]
+            extra: Dict[str, Any] = {}
+            for sf in payload.scalar_fields:
+                val = props.get(sf)
+                if val is not None and val != "":
+                    extra[sf] = val
+            for gf in payload.graph_fields:
+                vals = c_data.get("relations", {}).get(gf)
+                if vals:
+                    first_val = vals[0] if isinstance(vals, list) else vals
+                    if first_val:
+                        extra[gf] = first_val
+            ev_extra_nodes.append({
+                "id": slug,
+                "label": name,
+                "color": {
+                    "background": color,
+                    "border":     color,
+                    "highlight":  {"background": "#ffffff", "border": color},
+                },
+                "size":           8.0,
+                "font":           {"size": 12},
+                "title":          name,
+                "_community":     cid,
+                "_community_name": cname_map.get(name, "Other"),
+                "_source_file":   concept_first_source.get(name, ""),
+                "_file_type":     "concept",
+                "_degree":        degree.get(name, 0),
+                "_extra":         extra,
+            })
+
+    raw_nodes = []
+    for name in kept:
+        cid = cid_map.get(name, 0)
+        color = _HTML_PALETTE[cid % len(_HTML_PALETTE)]
+        deg = degree.get(name, 0)
+        size = 8 + min(deg, 30) * 1.0
+
+        c_data = concept_index.get(name, {})
+        props = c_data.get("props", {})
+        relations = c_data.get("relations", {})
+
+        extra: Dict[str, Any] = {}
+        for sf in payload.scalar_fields:
+            val = props.get(sf)
+            if val is not None and val != "":
+                extra[sf] = val
+        for gf in payload.graph_fields:
+            vals = relations.get(gf)
+            if vals:
+                first_val = vals[0] if isinstance(vals, list) else vals
+                if first_val:
+                    extra[gf] = first_val
+
+        raw_nodes.append({
+            "id": slug_map[name],
+            "label": name,
+            "color": {
+                "background": color,
+                "border": color,
+                "highlight": {"background": "#ffffff", "border": color},
+            },
+            "size": size,
+            "font": {"size": 12},
+            "title": name,
+            "community": cid,
+            "community_name": cname_map.get(name, "Other"),
+            "source_file": concept_first_source.get(name, ""),
+            "file_type": "concept",
+            "degree": deg,
+            "extra": extra,
+        })
+
+    # Group all chains by canonical (sorted) pair — merges bidirectional pairs.
+    # edge_seen_dirs tracks which original (src, tgt) directions exist per pair.
+    edge_groups: Dict[tuple, List[Dict[str, Any]]] = {}
+    edge_seen_dirs: Dict[tuple, set] = {}
+    for ch in filtered_chains:
+        src_id = slug_map.get(ch["source"], _html_slug(ch["source"]))
+        tgt_id = slug_map.get(ch["target"], _html_slug(ch["target"]))
+        canonical = tuple(sorted([src_id, tgt_id]))
+        edge_groups.setdefault(canonical, []).append(ch)
+        edge_seen_dirs.setdefault(canonical, set()).add((src_id, tgt_id))
+
+    raw_edges = []
+    for canonical, group in edge_groups.items():
+        src_id, tgt_id = canonical
+        is_bidir = len(edge_seen_dirs[canonical]) > 1
+
+        rel_counts: Dict[str, int] = {}
+        for ch in group:
+            rel_counts[ch["type"]] = rel_counts.get(ch["type"], 0) + 1
+
+        dominant_rel = max(rel_counts, key=lambda r: rel_counts[r])
+        color = _html_relation_color(dominant_rel)
+        total = sum(rel_counts.values())
+        width = min(1.0 + total * 0.4, 4.0)
+
+        rel_parts = sorted(rel_counts.items(), key=lambda x: -x[1])
+        title = " · ".join(
+            f"{r}×{c}" if c > 1 else r for r, c in rel_parts
+        )
+
+        edge: Dict[str, Any] = {
+            "from": src_id,
+            "to": tgt_id,
+            "label": "",
+            "title": title,
+            "relation": dominant_rel,
+            "relations": [{"type": r, "count": c} for r, c in rel_parts],
+            "total": total,
+            "dashes": False,
+            "width": width,
+            "color": {"color": color, "opacity": 0.7},
+            "confidence": "EXTRACTED",
+            "bidirectional": is_bidir,
+        }
+        if is_bidir:
+            edge["arrows"] = {
+                "to":   {"enabled": True, "scaleFactor": 0.4},
+                "from": {"enabled": True, "scaleFactor": 0.4},
+            }
+        raw_edges.append(edge)
+
+    hyperedges = _html_build_hyperedges(payload, kept, config.max_hyperedges, slug_map)
+
+    communities_count = len(set(cid_map.values()))
+    hidden_count = len(payload.concepts) - len(kept)
+    stats_parts = [
+        f"{len(kept)} nodes",
+        f"{len(raw_edges)} edges",
+        f"{communities_count} communities",
+    ]
+    if hidden_count > 0:
+        stats_parts.append(f"{hidden_count} hidden by filter")
+    stats_text = " · ".join(stats_parts)
+
+    tmpl = template_path.read_text("utf-8")
+    return (
+        tmpl
+        .replace("{{TITLE}}", f"{payload.project_name} — Synesis Graph")
+        .replace("{{RAW_NODES_JSON}}", json.dumps(raw_nodes, ensure_ascii=False))
+        .replace("{{RAW_EDGES_JSON}}", json.dumps(raw_edges, ensure_ascii=False))
+        .replace("{{ALL_GROUPINGS_JSON}}", json.dumps(all_groupings, ensure_ascii=False))
+        .replace("{{ACTIVE_GROUPING}}", json.dumps(legend_title))
+        .replace("{{HYPEREDGES_JSON}}", json.dumps(hyperedges, ensure_ascii=False))
+        .replace("{{EVIDENCE_JSON}}",      json.dumps(evidence_by_slug, ensure_ascii=False))
+        .replace("{{EV_SOURCE_NODES_JSON}}", json.dumps(ev_extra_nodes, ensure_ascii=False))
+        .replace("{{EV_MENTION_EDGES_JSON}}", json.dumps(ev_chain_edges, ensure_ascii=False))
+        .replace("{{STATS_TEXT}}", stats_text)
+    )
+
+
+class HTMLBackendAdapter(BackendAdapter):
+    """HTML graph backend — renders a self-contained vis-network HTML file."""
+
+    def __init__(self, config: HTMLConfig, config_path: Path):
+        self.config = config
+        self._template_path = config_path.parent / "templates" / "graph.html.tmpl"
+        self._output_path: Optional[Path] = None
+
+    @property
+    def backend_name(self) -> str:
+        return BACKEND_HTML
+
+    def preflight(self, reporter: TaskReporter) -> Optional[PipelineError]:
+        if not self._template_path.exists():
+            return DependencyError(
+                message="HTML template not found",
+                stage="preflight",
+                details=str(self._template_path),
+            )
+        return None
+
+    def connect(self, reporter: TaskReporter) -> Optional[PipelineError]:
+        return None
+
+    def prepare_destination(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        output = Path(self.config.output_path)
+        if not output.is_absolute():
+            output = Path.cwd() / output
+        self._output_path = output
+        try:
+            self._output_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return ConnectionError(
+                message="Cannot create output directory",
+                stage="prepare",
+                details=str(e),
+            )
+        return None
+
+    def clear_destination(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        return None
+
+    def synchronize_payload(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        if self._output_path is None:
+            return ConnectionError(message="Output path not initialized", stage="sync")
+        with reporter.step("Rendering HTML graph"):
+            try:
+                html = _html_render_payload(payload, self.config, self._template_path)
+                self._output_path.write_text(html, encoding="utf-8")
+                reporter.info(
+                    f"[{self.backend_name}] {len(html):,} bytes -> {self._output_path}"
+                )
+            except Exception as e:
+                return SyncError(
+                    message="Failed to render HTML graph",
+                    stage="sync",
+                    details=str(e),
+                )
+        return None
+
+    def compute_backend_metrics(self, payload: GraphPayload, reporter: TaskReporter) -> Optional[PipelineError]:
+        return None
+
+    def close(self) -> None:
+        pass
+
+
 def build_backend_adapter(
     backend: str,
     config: PipelineConfig,
@@ -1957,6 +2642,15 @@ def build_backend_adapter(
                 details="Expected GraphQLiteConfig for backend 'graphqlite'.",
             )
         return GraphQLiteBackendAdapter(config, config_path=config_path, project_path=project_path)
+
+    if backend == BACKEND_HTML:
+        if not isinstance(config, HTMLConfig):
+            return ConnectionError(
+                message="Internal configuration type mismatch",
+                stage="config",
+                details="Expected HTMLConfig for backend 'html'.",
+            )
+        return HTMLBackendAdapter(config, config_path=config_path)
 
     return ConnectionError(
         message="Unsupported backend",
@@ -2031,18 +2725,22 @@ def execute_backend_pipeline(
 # MAIN PIPELINE
 # ============================================================================
 def run_pipeline(
-    project_path: Path,
+    project_path: Optional[Path],
     config_path: Path,
     reporter: TaskReporter,
     backend: str = BACKEND_NEO4J,
+    html_options: Optional[Dict[str, Any]] = None,
+    json_path: Optional[Path] = None,
 ) -> PipelineResult:
     """
     Executes complete pipeline: compilation → connection → synchronization.
 
     Args:
-        project_path: Path to .synp project
+        project_path: Path to .synp project (mutually exclusive with json_path)
         config_path: Path to config.toml
         reporter: Reporter for visual feedback
+        html_options: Optional CLI overrides for the HTML backend (keys match HTMLConfig fields)
+        json_path: Path to pre-compiled Synesis JSON export (alternative to project_path)
 
     Returns:
         PipelineResult indicating success or typed error.
@@ -2058,13 +2756,23 @@ def run_pipeline(
             ),
         )
 
-    if not project_path.exists():
+    if json_path is None and project_path is None:
         return PipelineResult(
             success=False,
             error=CompilationError(
-                message="Project not found",
+                message="Either --project or --json must be specified",
                 stage="validation",
-                details=str(project_path)
+            )
+        )
+
+    source_path = json_path or project_path
+    if not source_path.exists():
+        return PipelineResult(
+            success=False,
+            error=CompilationError(
+                message="Input file not found",
+                stage="validation",
+                details=str(source_path)
             )
         )
 
@@ -2075,6 +2783,11 @@ def run_pipeline(
             return PipelineResult(success=False, error=config_result)
         config = config_result
 
+        if backend == BACKEND_HTML and html_options and isinstance(config, HTMLConfig):
+            for k, v in html_options.items():
+                if v is not None and hasattr(config, k):
+                    setattr(config, k, v)
+
         config_error = validate_backend_config(config, backend)
         if config_error:
             return PipelineResult(success=False, error=config_error)
@@ -2083,7 +2796,7 @@ def run_pipeline(
         backend=backend,
         config=config,
         config_path=config_path,
-        project_path=project_path,
+        project_path=project_path or Path("."),
     )
     if isinstance(adapter_result, ConnectionError):
         return PipelineResult(
@@ -2096,9 +2809,16 @@ def run_pipeline(
     if preflight_error:
         return PipelineResult(success=False, error=preflight_error)
 
-    # 3. Compilation
-    with reporter.step("Compiling Project (In-Memory)"):
-        compile_result = compile_project(project_path, reporter)
+    # 3. Compilation or JSON load
+    if json_path is not None:
+        step_label = "Loading JSON Export"
+        load_fn = lambda: load_json_project(json_path, reporter)
+    else:
+        step_label = "Compiling Project (In-Memory)"
+        load_fn = lambda: compile_project(project_path, reporter)
+
+    with reporter.step(step_label):
+        compile_result = load_fn()
         if isinstance(compile_result, CompilationError):
             reporter.print_diagnostics(compile_result.diagnostics)
             return PipelineResult(success=False, error=compile_result)
@@ -2123,51 +2843,323 @@ def run_pipeline(
     )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Synesis Direct Link → Graph Databases",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Exemplos:
-  python synesis2graph.py --project ./meu_projeto.synp
-  python synesis2graph.py --project ./analise.synp --config prod.toml
-  python synesis2graph.py --project ./analise.synp --backend neo4j
-        """
-    )
-    parser.add_argument(
-        "--version", "-v",
-        action="version",
-        version=f"synesis2graph {__version__}"
-    )
-    parser.add_argument("--project", required=True, help="Caminho para o arquivo .synp")
-    parser.add_argument("--config", default="config.toml", help="Configurações de conexão")
-    parser.add_argument(
-        "--backend",
-        choices=SUPPORTED_BACKENDS,
-        default=BACKEND_NEO4J,
-        help="Backend de destino (neo4j ou graphqlite).",
-    )
-    args = parser.parse_args()
+# ============================================================================
+# CLI — Click-based (same pattern as synesis and synesis-coder)
+# ============================================================================
 
-    reporter = TaskReporter(f"Synesis Direct Link ({args.backend})")
+def _tty() -> bool:
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
-    result = run_pipeline(
-        project_path=Path(args.project).resolve(),
-        config_path=Path(args.config).resolve(),
-        reporter=reporter,
-        backend=args.backend,
+
+def _c(text: str, **kwargs) -> str:
+    if not _CLICK_AVAILABLE:
+        return text
+    return click.style(text, **kwargs) if _tty() else text
+
+
+def _build_main_help() -> str:
+    title = _c("SYNESIS GRAPH", fg="green", bold=True) + f" (v{__version__})"
+    desc = "Universal pipeline from Synesis projects to graph databases and visualizations."
+    usage = _c("Usage:", fg="yellow", bold=True) + " synesis-graph [OPTIONS] COMMAND [ARGUMENTS]..."
+
+    groups = [
+        ("Graph Backends", [
+            ("neo4j",      "Sync project to a Neo4j database (bolt://)"),
+            ("graphqlite", "Sync project to a GraphQLite SQLite file"),
+            ("html",       "Render an interactive HTML graph visualization"),
+        ]),
+    ]
+
+    opt_rows = [
+        ("--version", "Show version and exit"),
+        ("--help",    "Show this message and exit"),
+    ]
+
+    col = max(
+        max(len(name) for _, rows in groups for name, _ in rows),
+        max(len(name) for name, _ in opt_rows),
+    ) + 2
+
+    options = _c("Options:", fg="yellow", bold=True) + "\n" + "\n".join(
+        f"  {_c(name.ljust(col), fg='cyan')}  {desc_}"
+        for name, desc_ in opt_rows
     )
 
-    if result.success:
-        reporter.info(f"Estatísticas: {result.stats}")
+    def _render_group(label: str, rows: list) -> str:
+        lines = [_c("  " + label, fg="yellow", bold=True)]
+        for name, desc_ in rows:
+            lines.append(f"    {_c(name.ljust(col), fg='green', bold=True)}  {desc_}")
+        return "\n".join(lines)
+
+    commands = _c("Commands:", fg="yellow", bold=True) + "\n\n" + "\n\n".join(
+        _render_group(label, rows) for label, rows in groups
+    )
+
+    hint = _c(
+        "Run 'synesis-graph COMMAND --help' for options and examples of each backend.",
+        fg="bright_black",
+    )
+
+    return "\n\n".join([title, desc, usage, options, commands, hint]) + "\n"
+
+
+def _ex(*lines: str) -> str:
+    out = [_c("Examples:", fg="yellow", bold=True)]
+    for line in lines:
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+        if stripped.startswith("#"):
+            out.append(indent + _c(stripped, fg="bright_black"))
+        else:
+            tokens = re.split(r"(\s+)", stripped)
+            result = []
+            for tok in tokens:
+                if tok == "synesis-graph":
+                    result.append(_c(tok, fg="green", bold=True))
+                elif re.match(r"^--[\w-]+=?", tok):
+                    result.append(_c(tok, fg="cyan"))
+                elif tok in ("neo4j", "graphqlite", "html"):
+                    result.append(_c(tok, fg="green"))
+                else:
+                    result.append(tok)
+            out.append(indent + "".join(result))
+    return "\n".join(out)
+
+
+_EPILOG_NEO4J = _ex(
+    "  # Sync with default config (config.toml, bolt://127.0.0.1:7687):",
+    "  synesis-graph neo4j --project project.synp",
+    "",
+    "  # Use a custom config file:",
+    "  synesis-graph neo4j --project project.synp --config prod.toml",
+    "",
+    "  # Load from pre-compiled JSON (Synesis v3.0 export):",
+    "  synesis-graph neo4j --json export.json --config prod.toml",
+    "",
+    "  # Target a specific named database:",
+    "  synesis-graph neo4j --project project.synp --database my_corpus",
+)
+
+_EPILOG_GRAPHQLITE = _ex(
+    "  # Sync to a local SQLite file (default path from config.toml):",
+    "  synesis-graph graphqlite --project project.synp",
+    "",
+    "  # Custom config:",
+    "  synesis-graph graphqlite --project project.synp --config custom.toml",
+    "",
+    "  # Load from pre-compiled JSON:",
+    "  synesis-graph graphqlite --json export.json",
+)
+
+_EPILOG_HTML = _ex(
+    "  # Render with default filters (min 3 mentions, min 2 sources):",
+    "  synesis-graph html --project project.synp --output graph.html",
+    "",
+    "  # Disable all filters (show every concept):",
+    "  synesis-graph html --project project.synp --output graph.html --all",
+    "",
+    "  # Color communities by a taxonomy field:",
+    "  synesis-graph html --project project.synp --output graph.html --group-by topic",
+    "",
+    "  # Tune filters manually:",
+    "  synesis-graph html --project project.synp --output graph.html --min-frequency 5 --max-nodes 100",
+    "",
+    "  # From pre-compiled JSON:",
+    "  synesis-graph html --json export.json --output graph.html --all",
+)
+
+
+def _write_help_utf8() -> None:
+    out = _build_main_help()
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout.buffer.write(out.encode("utf-8"))
+        sys.stdout.buffer.flush()
     else:
-        reporter.error(f"[{result.error.stage}] {result.error.message}")
-        if result.error.details:
-            reporter.info(f"Detalhes: {result.error.details}")
+        print(out)
 
+
+def _validate_source(project, json_input) -> None:
+    if not project and not json_input:
+        raise click.UsageError("Provide either --project PATH or --json PATH.")
+    if project and json_input:
+        raise click.UsageError("--project and --json are mutually exclusive.")
+
+
+def _run_and_exit(backend: str, project, json_input, config, html_options=None) -> None:
+    reporter = TaskReporter(f"Synesis → {backend}")
+    result = run_pipeline(
+        project_path=Path(project).resolve() if project else None,
+        json_path=Path(json_input).resolve() if json_input else None,
+        config_path=Path(config).resolve(),
+        reporter=reporter,
+        backend=backend,
+        html_options=html_options,
+    )
     reporter.print_summary()
-    return 0 if result.success else 1
+    sys.exit(0 if result.success else 1)
+
+
+# Shared decorators
+def _source_options(fn):
+    fn = click.option("--json", "json_input", default=None, metavar="PATH",
+                      help="Path to a Synesis v3.0 JSON export (alternative to --project).")(fn)
+    fn = click.option("--project", default=None, metavar="PATH",
+                      help="Path to a Synesis project file (.synp).")(fn)
+    return fn
+
+
+def _config_option(fn):
+    return click.option("--config", default="config.toml", show_default=True, metavar="PATH",
+                        help="Path to the TOML configuration file.")(fn)
+
+
+if _CLICK_AVAILABLE:
+    class _SynesisCommand(click.Command):
+        def format_epilog(self, ctx, formatter):
+            if self.epilog:
+                formatter.write("\n")
+                for line in self.epilog.splitlines():
+                    formatter.write(line + "\n")
+
+    class _SynesisGroup(click.Group):
+        command_class = _SynesisCommand
+
+        def format_help(self, ctx, formatter):
+            pass
+
+        def get_help(self, ctx):
+            _write_help_utf8()
+            raise SystemExit(0)
+
+    @click.group(cls=_SynesisGroup, invoke_without_command=True)
+    @click.version_option(version=__version__, prog_name="synesis-graph")
+    @click.pass_context
+    def main(ctx) -> None:
+        """Universal pipeline from Synesis projects to graph databases."""
+        if ctx.invoked_subcommand is None:
+            _write_help_utf8()
+
+    @main.command(cls=_SynesisCommand, name="neo4j", epilog=_EPILOG_NEO4J)
+    @_source_options
+    @_config_option
+    @click.option("--database", default=None,
+                  help="Neo4j database name (overrides config).")
+    def cmd_neo4j(project, json_input, config, database):
+        """Sync a Synesis project to a Neo4j database."""
+        _validate_source(project, json_input)
+        _run_and_exit(BACKEND_NEO4J, project, json_input, config)
+
+    @main.command(cls=_SynesisCommand, name="graphqlite", epilog=_EPILOG_GRAPHQLITE)
+    @_source_options
+    @_config_option
+    def cmd_graphqlite(project, json_input, config):
+        """Sync a Synesis project to a GraphQLite SQLite file."""
+        _validate_source(project, json_input)
+        _run_and_exit(BACKEND_GRAPHQLITE, project, json_input, config)
+
+    @main.command(cls=_SynesisCommand, name="html", epilog=_EPILOG_HTML)
+    @_source_options
+    @_config_option
+    @click.option("--output", "html_output", default=None, metavar="PATH",
+                  help="Output HTML file (default: ./graph.html).")
+    @click.option("--group-by", "group_by", default=None, metavar="FIELD",
+                  help="Template graph field for community colouring.")
+    @click.option("--min-frequency", "min_frequency", type=int, default=None, metavar="N",
+                  help="Hide concepts mentioned in fewer than N items (default: 3).")
+    @click.option("--min-source-count", "min_source_count", type=int, default=None, metavar="N",
+                  help="Hide concepts appearing in fewer than N sources (default: 2).")
+    @click.option("--max-nodes", "max_nodes", type=int, default=None, metavar="N",
+                  help="Limit to top-N concepts by degree (default: 200; 0 = unlimited).")
+    @click.option("--max-hyperedges", "max_hyperedges", type=int, default=None, metavar="N",
+                  help="Maximum hyperedges to render (default: 50).")
+    @click.option("--include-isolated", "include_isolated", is_flag=True, default=False,
+                  help="Include concepts with no chain connections.")
+    @click.option("--all", "html_all", is_flag=True, default=False,
+                  help="Disable all filters (show every concept).")
+    def cmd_html(project, json_input, config, html_output, group_by, min_frequency,
+                 min_source_count, max_nodes, max_hyperedges, include_isolated, html_all):
+        """Render an interactive HTML graph visualization from a Synesis project."""
+        _validate_source(project, json_input)
+        html_options: Dict[str, Any] = {}
+        if html_output:
+            html_options["output_path"] = html_output
+        if html_all:
+            html_options.update({"min_frequency": 0, "min_source_count": 0,
+                                  "max_nodes": 0, "include_isolated": True})
+        else:
+            if group_by is not None:
+                html_options["group_by"] = group_by
+            if min_frequency is not None:
+                html_options["min_frequency"] = min_frequency
+            if min_source_count is not None:
+                html_options["min_source_count"] = min_source_count
+            if max_nodes is not None:
+                html_options["max_nodes"] = max_nodes
+            if max_hyperedges is not None:
+                html_options["max_hyperedges"] = max_hyperedges
+            if include_isolated:
+                html_options["include_isolated"] = True
+        _run_and_exit(BACKEND_HTML, project, json_input, config, html_options)
+
+else:
+    # Fallback: argparse when click is not installed
+    import argparse
+
+    def main() -> int:  # type: ignore[misc]
+        import argparse as _ap
+        parser = _ap.ArgumentParser(description="Synesis Direct Link → Graph Databases")
+        parser.add_argument("--version", "-v", action="version",
+                            version=f"synesis-graph {__version__}")
+        src = parser.add_mutually_exclusive_group(required=True)
+        src.add_argument("--project", default=None)
+        src.add_argument("--json", default=None, dest="json_input")
+        parser.add_argument("--config", default="config.toml")
+        parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default=BACKEND_NEO4J)
+        parser.add_argument("--html-output", default=None)
+        parser.add_argument("--html-group-by", default=None)
+        parser.add_argument("--html-min-frequency", type=int, default=None)
+        parser.add_argument("--html-min-source-count", type=int, default=None)
+        parser.add_argument("--html-max-nodes", type=int, default=None)
+        parser.add_argument("--html-max-hyperedges", type=int, default=None)
+        parser.add_argument("--html-include-isolated", action="store_true", default=False)
+        parser.add_argument("--html-all", action="store_true", default=False)
+        args = parser.parse_args()
+
+        html_options: Optional[Dict[str, Any]] = None
+        if args.backend == BACKEND_HTML:
+            html_options = {}
+            if args.html_output:
+                html_options["output_path"] = args.html_output
+            if args.html_all:
+                html_options.update({"min_frequency": 0, "min_source_count": 0,
+                                     "max_nodes": 0, "include_isolated": True})
+            else:
+                if args.html_group_by:
+                    html_options["group_by"] = args.html_group_by
+                if args.html_min_frequency is not None:
+                    html_options["min_frequency"] = args.html_min_frequency
+                if args.html_min_source_count is not None:
+                    html_options["min_source_count"] = args.html_min_source_count
+                if args.html_max_nodes is not None:
+                    html_options["max_nodes"] = args.html_max_nodes
+                if args.html_max_hyperedges is not None:
+                    html_options["max_hyperedges"] = args.html_max_hyperedges
+                if args.html_include_isolated:
+                    html_options["include_isolated"] = True
+
+        reporter = TaskReporter(f"Synesis Direct Link ({args.backend})")
+        result = run_pipeline(
+            project_path=Path(args.project).resolve() if args.project else None,
+            json_path=Path(args.json_input).resolve() if args.json_input else None,
+            config_path=Path(args.config).resolve(),
+            reporter=reporter, backend=args.backend, html_options=html_options,
+        )
+        reporter.print_summary()
+        return 0 if result.success else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if _CLICK_AVAILABLE:
+        main(standalone_mode=True)
+    else:
+        sys.exit(main())

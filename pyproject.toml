@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synesis-graph"
+version = "0.3.0"
+description = "Universal pipeline from Synesis projects to graph databases and HTML visualizations"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "De Britto, Christian Maciel", email = "chriseana@gmail.com"}
+]
+keywords = [
+    "synesis",
+    "neo4j",
+    "knowledge-graph",
+    "qualitative-research",
+    "graph-database",
+    "pipeline",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Database",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "synesis>=0.5.0",
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+neo4j = ["neo4j>=5.0"]
+graphqlite = ["graphqlite"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+
+[project.urls]
+Repository = "https://github.com/synesis-lang/synesis-graph"
+Changelog = "https://github.com/synesis-lang/synesis-graph/blob/main/CHANGELOG.md"
+
+[project.scripts]
+synesis-graph = "synesis_graph.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["synesis_graph*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
